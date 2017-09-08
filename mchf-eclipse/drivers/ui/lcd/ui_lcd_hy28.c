@@ -13,7 +13,7 @@
  ************************************************************************************/
 
 // Common
-#include "mchf_board_config.h"
+#include "uhsdr_board_config.h"
 
 #ifdef UI_BRD_MCHF
     #define USE_DISPLAY_SPI
@@ -55,6 +55,7 @@
 
 #include "ui_lcd_hy28_fonts.h"
 #include "ui_lcd_hy28.h"
+#include "uhsdr_board.h"
 
 mchf_display_t mchf_display;
 
@@ -68,27 +69,34 @@ mchf_display_t mchf_display;
 
 
 
+
+
+#ifndef BOOTLOADER_BUILD
+
 // Saved fonts
 extern sFONT GL_Font8x8;
 extern sFONT GL_Font8x12;
 extern sFONT GL_Font8x12_bold;
-extern sFONT GL_Font8x12_bold_short;
 extern sFONT GL_Font12x12;
 extern sFONT GL_Font16x24;
 
-
 static sFONT *fontList[] =
 {
-#ifndef BOOTLOADER_BUILD
         &GL_Font8x12_bold,
         &GL_Font16x24,
         &GL_Font12x12,
         &GL_Font8x12,
         &GL_Font8x8,
-#else
-        &GL_Font8x12_bold_short,
-#endif
 };
+
+#else
+extern sFONT GL_Font8x12_bold_short;
+
+static sFONT *fontList[] =
+{
+        &GL_Font8x12_bold_short,
+};
+#endif
 
 // we can do this here since fontList is an array variable not just a pointer!
 static const uint8_t fontCount = sizeof(fontList)/sizeof(fontList[0]);
@@ -343,7 +351,7 @@ static inline bool UiLcdHy28_SpiDisplayUsed()
 }
 
 
-void UiLcdHy28_BacklightInit(void)
+void UiLcdHy28_BacklightInit()
 {
     GPIO_InitTypeDef  GPIO_InitStructure;
 
@@ -517,7 +525,7 @@ void UiLcdHy28_Reset()
 }
 
 
-void UiLcdHy28_FSMCConfig(void)
+void UiLcdHy28_FSMCConfig()
 {
     MEM_Init();
 }
@@ -565,7 +573,7 @@ static void UiLcdHy28_LcdSpiFinishTransfer()
     GPIO_SetBits(mchf_display.lcd_cs_pio, mchf_display.lcd_cs);
 }
 
-uint8_t UiLcdHy28_SpiReadByte(void)
+uint8_t UiLcdHy28_SpiReadByte()
 {
     uint8_t dummy = 0;
     uint8_t retval = 0;
@@ -576,7 +584,7 @@ uint8_t UiLcdHy28_SpiReadByte(void)
     return retval;
 }
 
-uint8_t UiLcdHy28_SpiReadByteFast(void)
+uint8_t UiLcdHy28_SpiReadByteFast()
 {
     uint8_t retval = 0;
 
@@ -779,7 +787,7 @@ static void UiLcdHy28_OpenBulkWrite(ushort x, ushort width, ushort y, ushort hei
 
 }
 
-static void UiLcdHy28_CloseBulkWrite(void)
+static void UiLcdHy28_CloseBulkWrite()
 {
 }
 
@@ -1027,45 +1035,86 @@ const sFONT   *UiLcdHy28_Font(uint8_t font)
     return fontList[font < fontCount ? font : 0];
 }
 
-void UiLcdHy28_PrintText(uint16_t Xpos, uint16_t Ypos, const char *str,const uint32_t Color, const uint32_t bkColor,uchar font)
+static void UiLcdHy28_PrintTextLen(uint16_t XposStart, uint16_t YposStart, const char *str, const uint16_t len, const uint32_t clr_fg, const uint32_t clr_bg,uchar font)
 {
-    uint8_t    TempChar;
     const sFONT   *cf = UiLcdHy28_Font(font);
+    int8_t Xshift =  cf->Width - ((cf->Width == 8 && cf->Height == 8)?1:0);
+    // Mod the 8x8 font - the shift is too big
+
+    uint16_t XposCurrent = XposStart;
+    uint16_t YposCurrent = YposStart;
 
     if (str != NULL)
     {
-        while ( *str != 0 )
+        for (uint16_t idx = 0; idx < len; idx++)
         {
-            TempChar = *str++;
+            uint8_t TempChar = *str++;
 
-            UiLcdHy28_DrawChar(Xpos, Ypos, TempChar,Color,bkColor,cf);
+            UiLcdHy28_DrawChar(XposCurrent, YposCurrent, TempChar,clr_fg,clr_bg,cf);
 
-            if(Xpos < (MAX_X - cf->Width))
+            if(XposCurrent < (MAX_X - Xshift))
             {
-                Xpos += cf->Width;
-
-                // Mod the 8x8 font - the shift is too big
-                // because of the letters
-                if(font == 4)
-                {
-                 //   if(*str > 0x39)
-                        Xpos -= 1;
-                   // else
-                   //     Xpos -= 2;
-                }
+                XposCurrent += Xshift;
             }
-            else if (Ypos < (MAX_Y - cf->Height))
+            else if (YposCurrent < (MAX_Y - cf->Height))
             {
-                Xpos  = 0;
-                Ypos += cf->Height;
+                XposCurrent  = XposStart;
+                YposCurrent += cf->Height;
             }
             else
             {
-                Xpos = 0;
-                Ypos = 0;
+                XposCurrent = XposStart;
+                YposCurrent = XposStart;
             }
         }
     }
+}
+
+
+/**
+ * @returns pointer to next end of line or next end of string character
+ */
+static const char * UiLcdHy28_StringGetLine(const char* str)
+{
+
+    const char* retval;
+
+    for (retval = str; *retval != '\0' && *retval != '\n'; retval++ );
+    return retval;
+}
+
+/**
+ * @brief Print multi-line text. New lines start right at XposStart
+ * @returns next unused Y line (i.e. the Y coordinate just below the last printed text line).
+ */
+uint16_t UiLcdHy28_PrintText(uint16_t XposStart, uint16_t YposStart, const char *str,const uint32_t clr_fg, const uint32_t clr_bg,uchar font)
+{
+    const sFONT   *cf = UiLcdHy28_Font(font);
+    int8_t Yshift =  cf->Height;
+
+    uint16_t YposCurrent = YposStart;
+
+    if (str != NULL)
+    {
+        const char* str_start = str;
+
+        for (const char* str_end = UiLcdHy28_StringGetLine(str_start); str_start != str_end; str_end = UiLcdHy28_StringGetLine(str_start))
+        {
+            UiLcdHy28_PrintTextLen(XposStart, YposCurrent, str_start, str_end - str_start, clr_fg, clr_bg, font);
+            YposCurrent += Yshift;
+            if (*str_end == '\n')
+            {
+                // next character after line break
+                str_start = str_end + 1;
+            }
+            else
+            {
+                // last character in string
+                str_start = str_end;
+            }
+        }
+    }
+    return YposCurrent;
 }
 
 
@@ -1076,35 +1125,43 @@ uint16_t UiLcdHy28_TextHeight(uint8_t font)
     return cf->Height;
 }
 
-
-uint16_t UiLcdHy28_TextWidth(const char *str, uchar font)
+/**
+ * @returns pixelwidth of a text of given length
+ */
+static uint16_t UiLcdHy28_TextWidthLen(const char *str_start, uint16_t len, uchar font)
 {
 
-    uint16_t Xpos = 0;
+    uint16_t retval = 0;
 
     const sFONT   *cf = UiLcdHy28_Font(font);
-    if (str != NULL)
+    int8_t Xshift =  cf->Width - ((cf->Width == 8 && cf->Height == 8)?1:0);
+
+    if (str_start != NULL)
     {
-        while ( *str != 0 )
-        {
-            Xpos+=cf->Width;
-            if(font == 4)
-            {
-                if(*str > 0x39)
-                    Xpos -= 1;
-                else
-                    Xpos -= 2;
-            }
-            str++;
-        }
+        retval = len * Xshift;
     }
-    return Xpos;
+    return retval;
 }
 
-void UiLcdHy28_PrintTextRight(uint16_t Xpos, uint16_t Ypos, const char *str,const uint32_t Color, const uint32_t bkColor,uint8_t font)
+/**
+ * @returns pixelwidth of a text of given length
+ */
+uint16_t UiLcdHy28_TextWidth(const char *str_start, uchar font)
 {
 
-    uint16_t Xwidth = UiLcdHy28_TextWidth(str, font);
+    uint16_t retval = 0;
+
+    if (str_start != NULL)
+    {
+        retval = UiLcdHy28_TextWidthLen(str_start,strlen(str_start), font);
+    }
+    return retval;
+}
+
+static void UiLcdHy28_PrintTextRightLen(uint16_t Xpos, uint16_t Ypos, const char *str, uint16_t len, const uint32_t clr_fg, const uint32_t clr_bg,uint8_t font)
+{
+
+    uint16_t Xwidth = UiLcdHy28_TextWidthLen(str, len, font);
     if (Xpos < Xwidth )
     {
         Xpos = 0; // TODO: Overflow is not handled too well, just start at beginning of line and draw over the end.
@@ -1113,28 +1170,99 @@ void UiLcdHy28_PrintTextRight(uint16_t Xpos, uint16_t Ypos, const char *str,cons
     {
         Xpos -= Xwidth;
     }
-    UiLcdHy28_PrintText(Xpos, Ypos, str, Color, bkColor, font);
+    UiLcdHy28_PrintTextLen(Xpos, Ypos, str, len, clr_fg, clr_bg, font);
 }
 
-void UiLcdHy28_PrintTextCentered(const uint16_t bbX,const uint16_t bbY,const uint16_t bbW,const char* txt,uint32_t clr_fg,uint32_t clr_bg,uint8_t font)
+/**
+ * @brief Print multi-line text right aligned. New lines start right at XposStart
+ * @returns next unused Y line (i.e. the Y coordinate just below the last printed text line).
+ */
+uint16_t UiLcdHy28_PrintTextRight(uint16_t XposStart, uint16_t YposStart, const char *str,const uint32_t clr_fg, const uint32_t clr_bg,uint8_t font)
+{
+    // this code is a full clone of the PrintText function, with exception of the function call to PrintTextRightLen
+    const sFONT   *cf = UiLcdHy28_Font(font);
+    int8_t Yshift =  cf->Height;
+
+    uint16_t YposCurrent = YposStart;
+
+    if (str != NULL)
+    {
+        const char* str_start = str;
+
+        for (const char* str_end = UiLcdHy28_StringGetLine(str_start); str_start != str_end; str_end = UiLcdHy28_StringGetLine(str_start))
+        {
+            UiLcdHy28_PrintTextRightLen(XposStart, YposCurrent, str_start, str_end - str_start, clr_fg, clr_bg, font);
+            YposCurrent += Yshift;
+            if (*str_end == '\n')
+            {
+                // next character after line break
+                str_start = str_end + 1;
+            }
+            else
+            {
+                // last character in string
+                str_start = str_end;
+            }
+        }
+    }
+    return YposCurrent;
+}
+
+static void UiLcdHy28_PrintTextCenteredLen(const uint16_t XposStart,const uint16_t YposStart,const uint16_t bbW,const char* str, uint16_t len ,uint32_t clr_fg,uint32_t clr_bg,uint8_t font)
 {
     const uint16_t bbH = UiLcdHy28_TextHeight(font);
-    const uint16_t txtW = UiLcdHy28_TextWidth(txt,font);
+    const uint16_t txtW = UiLcdHy28_TextWidthLen(str, len, font);
     const uint16_t bbOffset = txtW>bbW?0:((bbW - txtW)+1)/2;
 
-    // we draw the part of  the box not used by text.
-    UiLcdHy28_DrawFullRect(bbX,bbY,bbH,bbOffset,clr_bg);
-    UiLcdHy28_PrintText((bbX + bbOffset),bbY,txt,clr_fg,clr_bg,font);
+    // we draw the part of the box not used by text.
+    if (bbOffset)
+    {
+        UiLcdHy28_DrawFullRect(XposStart,YposStart,bbH,bbOffset,clr_bg);
+    }
+
+    UiLcdHy28_PrintTextLen((XposStart + bbOffset),YposStart,str, len, clr_fg,clr_bg,font);
 
     // if the text is smaller than the box, we need to draw the end part of the
     // box
     if (txtW<bbW)
     {
-        UiLcdHy28_DrawFullRect(bbX+txtW+bbOffset,bbY,bbH,bbW-(bbOffset+txtW),clr_bg);
+        UiLcdHy28_DrawFullRect(XposStart+txtW+bbOffset,YposStart,bbH,bbW-(bbOffset+txtW),clr_bg);
     }
 }
 
-void UiLcdHy28_SendRegisters(const RegisterValue_t* regvals, uint16_t count)
+uint16_t UiLcdHy28_PrintTextCentered(const uint16_t XposStart,const uint16_t YposStart,const uint16_t bbW,const char* str,uint32_t clr_fg,uint32_t clr_bg,uint8_t font)
+{
+    // this code is a full clone of the PrintText function, with exception of the function call to PrintTextCenteredLen
+    const sFONT   *cf = UiLcdHy28_Font(font);
+    int8_t Yshift =  cf->Height;
+
+    uint16_t YposCurrent = YposStart;
+
+    if (str != NULL)
+    {
+        const char* str_start = str;
+
+        for (const char* str_end = UiLcdHy28_StringGetLine(str_start); str_start != str_end; str_end = UiLcdHy28_StringGetLine(str_start))
+        {
+            UiLcdHy28_PrintTextCenteredLen(XposStart, YposCurrent, bbW, str_start, str_end - str_start, clr_fg, clr_bg, font);
+            YposCurrent += Yshift;
+            if (*str_end == '\n')
+            {
+                // next character after line break
+                str_start = str_end + 1;
+            }
+            else
+            {
+                // last character in string
+                str_start = str_end;
+            }
+        }
+    }
+    return YposCurrent;
+}
+
+
+static void UiLcdHy28_SendRegisters(const RegisterValue_t* regvals, uint16_t count)
 {
     for (uint16_t idx = 0; idx < count; idx++)
     {
@@ -1149,7 +1277,7 @@ void UiLcdHy28_SendRegisters(const RegisterValue_t* regvals, uint16_t count)
     }
 }
 
-uint16_t UiLcdHy28_InitA(uint32_t display_type)
+static uint16_t UiLcdHy28_InitA(uint32_t display_type)
 {
 
     switch(display_type)
@@ -1406,22 +1534,32 @@ void UiLcdHy28_TouchscreenReadCoordinates()
             uint8_t xraw = mchf_touchscreen.xraw >> 5;
             uint8_t yraw = mchf_touchscreen.yraw >> 5;
 
-            if(mchf_touchscreen.reversed == false)
+			// actually known LCDs:
+			// mode 0: old HY28A and old HY28B
+			// mode 1: HY32D and 3.2" SPI LCD
+			// mode 6: new HY28B (?) reported by some OMs with soldered newer LCDs, cannot look on backside of LCD to verify type of LCD
+			// all other modes not used at the moment
+
+            if(mchf_touchscreen.mirrored == 0 || mchf_touchscreen.mirrored == 4)
             {
                 uint8_t i;
                 for(i=0; touchscreentable[i] < xraw && i < 60; i++);
                 x = 60-i;
+          		for(i=0; touchscreentable[i] < yraw && i < 60; i++);
+          		y = i--;
             }
-            else
-            {					// correction of unlinearity because of mirrored x
-                uint8_t k = 0;
-
+            if(mchf_touchscreen.mirrored == 1 || mchf_touchscreen.mirrored == 5)
+            {
                 uint8_t i;
                 for(i=60; touchscreentable[i] > xraw && i > 0; i--);
-
                 x = i--;
-
-
+          		for(i=0; touchscreentable[i] < yraw && i < 60; i++);
+          		y = i--;
+			}
+            if(mchf_touchscreen.mirrored == 1)
+            {
+				// correction of reversed x unlinearity only for HY32D
+                uint8_t k = 0;
                 if(x == 57 || (x < 7 && x > 1))	k=2;
                 if(x == 56 || (x == 8 || x == 7))	k=3;
                 if((x < 56 && x > 50) || (x < 16 && x > 8))	k=5;;
@@ -1432,10 +1570,29 @@ void UiLcdHy28_TouchscreenReadCoordinates()
                 if(x < 31 && x > 26)	k=10;
                 x = x - k;
             }
+            if(mchf_touchscreen.mirrored == 2 || mchf_touchscreen.mirrored == 6)
+            {
+                uint8_t i;
+                for(i=0; touchscreentable[i] < xraw && i < 60; i++);
+                x = 60-i;
+          		for(i=0; touchscreentable[i] < yraw && i < 60; i++);
+                y = 60-i;
+			}
+            if(mchf_touchscreen.mirrored == 3 || mchf_touchscreen.mirrored == 7)
+            {
+                uint8_t i;
+                for(i=60; touchscreentable[i] > xraw && i > 0; i--);
+                x = i--;
+          		for(i=0; touchscreentable[i] < yraw && i < 60; i++);
+                y = 60-i;
+			}
 
-            uint8_t i;
-            for(i=0; touchscreentable[i] < yraw && i < 60; i++);
-            y = i--;
+			if(ts.flags2 & FLAGS2_TOUCHSCREEN_FLIP_XY)
+			{
+			  uint8_t temp = x;
+			  x = y;
+			  y = temp;
+			}
 
             if(x == mchf_touchscreen.x && y == mchf_touchscreen.y)		// got identical data
             {
@@ -1456,7 +1613,7 @@ void UiLcdHy28_TouchscreenReadCoordinates()
     }
 }
 
-bool UiLcdHy28_TouchscreenPresenceDetection(void)
+bool UiLcdHy28_TouchscreenPresenceDetection()
 {
     bool retval = false;
     uint16_t x = 0xffff, y = 0xffff;
@@ -1473,13 +1630,13 @@ bool UiLcdHy28_TouchscreenPresenceDetection(void)
     return retval;
 }
 
-void UiLcdHy28_TouchscreenInit(bool is_reversed)
+void UiLcdHy28_TouchscreenInit(uint8_t mirror)
 {
     mchf_touchscreen.xraw = 0;
     mchf_touchscreen.yraw = 0;
     mchf_touchscreen.x = 0xFF;                        // invalid position
     mchf_touchscreen.y = 0xFF;                        // invalid position
-    mchf_touchscreen.reversed = is_reversed;
+    mchf_touchscreen.mirrored = mirror;
     mchf_touchscreen.present = UiLcdHy28_TouchscreenPresenceDetection();
 }
 

@@ -8,7 +8,7 @@
 #ifndef DRIVERS_UI_UI_MENU_INTERNAL_H_
 #define DRIVERS_UI_UI_MENU_INTERNAL_H_
 
-#include "mchf_types.h"
+#include "uhsdr_types.h"
 #define UiMenuDesc(a)
 
 //
@@ -92,7 +92,7 @@ enum
 //    CONFIG_SAM_PLL_TAUR,
 //    CONFIG_SAM_PLL_TAUI,
 //    CONFIG_SAM_SIDEBAND,
-    MENU_REVERSE_TOUCHSCREEN,
+    CONFIG_TOUCHSCREEN_MIRROR,
     MENU_CONFIG_ENABLE,
     MENU_RESTART_CODEC,
     CONFIG_FREQ_STEP_MARKER_LINE,
@@ -199,6 +199,7 @@ enum
     CONFIG_RESET_SER_EEPROM,
     CONFIG_CAT_IN_SANDBOX,
     CONFIG_CAT_XLAT,
+    CONFIG_CAT_PTT_RTS,
     CONFIG_REDUCE_POWER_ON_LOW_BANDS,
     CONFIG_REDUCE_POWER_ON_HIGH_BANDS,
     MENU_FP_CW_01,
@@ -218,18 +219,23 @@ enum
 //    MENU_FP_SAM_03,
 //    MENU_FP_SAM_04,
     MENU_DEBUG_TX_AUDIO,
-    MENU_DEBUG_I2C1_SPEED,
-    MENU_DEBUG_I2C2_SPEED,
+    CONFIG_I2C1_SPEED,
+    CONFIG_I2C2_SPEED,
+	MENU_DEBUG_ENABLE_INFO,
     MENU_DEBUG_CLONEOUT,
     MENU_DEBUG_CLONEIN,
     MENU_DEBUG_NEW_NB,
-    //
+	MENU_DEBUG_RTTY_ATC,
+	MENU_DEBUG_CW_DECODER,
+
     CONFIG_RTC_START,
     CONFIG_RTC_HOUR,
     CONFIG_RTC_MIN,
     CONFIG_RTC_SEC,
     CONFIG_RTC_RESET,
     CONFIG_RTC_CALIB,
+    MENU_DYNAMICTUNE,
+    MENU_DIGITAL_MODE_SELECT,
     MAX_RADIO_CONFIG_ITEM   // Number of radio configuration menu items - This must ALWAYS remain as the LAST item!
 };
 
@@ -242,7 +248,8 @@ enum MENU_KIND
     MENU_GROUP, // menu group entry
     MENU_INFO, // just like a normal entry (read-only) but just for display purposes.
     MENU_SEP, // separator line
-    MENU_BLANK // blank
+    MENU_BLANK, // blank
+    MENU_TEXT,	// text output only
 };
 
 

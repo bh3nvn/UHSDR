@@ -15,7 +15,7 @@
 #ifndef DRIVERS_AUDIO_AUDIO_FILTER_H_
 #define DRIVERS_AUDIO_AUDIO_FILTER_H_
 
-#include "mchf_types.h"
+#include "uhsdr_types.h"
 #include "arm_math.h"
 //
 extern arm_fir_instance_f32    FIR_Q_TX;
@@ -201,5 +201,21 @@ void     AudioFilter_GetNamesOfFilterPath(uint16_t filter_path,const char** filt
 uint16_t AudioFilter_GetFilterModeFromDemodMode(uint8_t dmod_mode);
 uint8_t  AudioFilter_NextApplicableFilter();
 void     AudioFilter_SetDefaultMemories();
+
+typedef struct
+{
+	float32_t a;
+	float32_t b;
+	float32_t sin;
+	float32_t cos;
+	float32_t r;
+	float32_t buf[3];
+} Goertzel;
+
+
+void AudioFilter_CalcGoertzel(Goertzel* g, float32_t freq, const uint32_t size, const float goertzel_coeff, float32_t samplerate);
+void AudioFilter_GoertzelInput(Goertzel* goertzel, float32_t in);
+float32_t AudioFilter_GoertzelEnergy(Goertzel* goertzel);
+
 
 #endif /* DRIVERS_AUDIO_AUDIO_FILTER_H_ */

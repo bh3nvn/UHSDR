@@ -13,7 +13,8 @@
  ************************************************************************************/
 
 // Common
-#include "mchf_board.h"
+#include <assert.h>
+#include "uhsdr_board.h"
 #include "profiling.h"
 
 #include <stdio.h>
@@ -27,7 +28,6 @@
 
 #include "audio_driver.h"
 #include "audio_management.h"
-#include "dds_table.h"
 #include "radio_management.h"
 #include "usbd_audio_if.h"
 #include "ui_spectrum.h"
@@ -35,8 +35,9 @@
 #include "ui_lcd_hy28.h"
 #include "ui_configuration.h"
 #include "ui_driver.h"
-#include "mchf_hw_i2s.h"
-
+#include "uhsdr_hw_i2s.h"
+#include "rtty.h"
+#include "cw_decoder.h"
 typedef struct {
     __packed int16_t l;
     __packed int16_t r;
@@ -438,7 +439,7 @@ extern __IO	KeypadState				ks;
 // ATTENTION: These data structures have been placed in CCM Memory (64k)
 // IF THE SIZE OF  THE DATA STRUCTURE GROWS IT WILL QUICKLY BE OUT OF SPACE IN CCM
 // Be careful! Check mchf-eclipse.map for current allocation
-__IO AudioDriverState   __MCHF_SPECIALMEM ads;
+AudioDriverState   __MCHF_SPECIALMEM ads;
 AudioDriverBuffer  __MCHF_SPECIALMEM adb;
 LMSData            __MCHF_SPECIALMEM lmsData;
 
@@ -498,21 +499,14 @@ void audio_driver_config_nco(void)
 //
  */
 
-//
-//*----------------------------------------------------------------------------
-//* Function Name       : audio_driver_init
-//* Object              :
-//* Object              :
-//* Input Parameters    :
-//* Output Parameters   :
-//* Functions called    :
-//*----------------------------------------------------------------------------
 void AudioDriver_Init(void)
 {
     const uint32_t word_size = WORD_SIZE_16;
 
     // CW module init
     CwGen_Init();
+
+    RttyDecoder_Init();
 
     // Audio filter disabled
     ts.dsp_inhibit = 1;
@@ -880,6 +874,8 @@ void AudioDriver_SetRxTxAudioProcessingAudioFilters(uint8_t dmod_mode)
     // the TX bass filter is in TX_biquad and works at 48000 sample rate
     AudioDriver_CalcLowShelf(coeffs, 300, 0.7, ts.tx_bass_gain, FS);
     AudioDriver_SetBiquadCoeffs(&IIR_TX_biquad.pCoeffs[5],coeffs,coeffs[A0]);
+
+    CwDecode_FilterInit();
 }
 
 
@@ -1284,11 +1280,16 @@ static void AudioDriver_NoiseBlanker(AudioSample_t * const src, int16_t blockSiz
 //* Output Parameters   : uses variables in ads structure
 //* Functions called    :
 //*----------------------------------------------------------------------------
-static void AudioDriver_FreqConversion(int16_t blockSize, int16_t dir)
+static void AudioDriver_FreqConversion(float32_t* i_buffer, float32_t* q_buffer, int16_t blockSize, int16_t dir)
 {
     static bool recalculate_Osc = false;
-    float32_t hh1 = 0.0;
-    float32_t hh2 = 0.0;
+    // keeps the generated data for frequency conversion
+    static float32_t                   Osc_I_buffer[IQ_BUFSZ];
+    static float32_t                   Osc_Q_buffer[IQ_BUFSZ];
+
+    assert(blockSize <= IQ_BUFSZ);
+
+
     //
     // Below is the "on-the-fly" version of the frequency translator, generating a "live" version of the oscillator (NCO), which can be any
     // frequency, based on the values of "ads.Osc_Cos" and "ads.Osc_Sin".  While this does function, the generation of the SINE takes a LOT
@@ -1300,7 +1301,7 @@ static void AudioDriver_FreqConversion(int16_t blockSize, int16_t dir)
     // This code is left here so that everyone can see how it is actually done in plain, "un-ARM" code.
     //
     /*
-    	for(i = 0; i < size/2; i++)	{
+    	for(i = 0; i < blockSize; i++)	{
     		// generate local oscillator on-the-fly:  This takes a lot of processor time!
     		ads.Osc_Q = (ads.Osc_Vect_Q * ads.Osc_Cos) - (ads.Osc_Vect_I * ads.Osc_Sin);	// Q channel of oscillator
     		ads.Osc_I = (ads.Osc_Vect_I * ads.Osc_Cos) + (ads.Osc_Vect_Q * ads.Osc_Sin);	// I channel of oscillator
@@ -1310,10 +1311,10 @@ static void AudioDriver_FreqConversion(int16_t blockSize, int16_t dir)
     		ads.Osc_Vect_I = ads.Osc_Gain * ads.Osc_I;
     		//
     		// do actual frequency conversion
-    		i_temp = adb.i_buffer[i];	// save temporary copies of data
-    		q_temp = adb.q_buffer[i];
-    		adb.i_buffer[i] = (i_temp * ads.Osc_Q) + (q_temp * ads.Osc_I);	// multiply I/Q data by sine/cosine data to do translation
-    		adb.q_buffer[i] = (q_temp * ads.Osc_Q) - (i_temp * ads.Osc_I);
+    		i_temp = i_buffer[i];	// save temporary copies of data
+    		q_temp = q_buffer[i];
+    		i_buffer[i] = (i_temp * ads.Osc_Q) + (q_temp * ads.Osc_I);	// multiply I/Q data by sine/cosine data to do translation
+    		q_buffer[i] = (q_temp * ads.Osc_Q) - (i_temp * ads.Osc_I);
     		//
     	}
      */
@@ -1342,17 +1343,15 @@ static void AudioDriver_FreqConversion(int16_t blockSize, int16_t dir)
             recalculate_Osc = true;
         }
     }
+
     if(recalculate_Osc == true)	 		// have we already calculated the sine wave?
     {
+        float32_t multiplier = (ts.multi * PI * 2) / ((float32_t)blockSize);
+
         for(int i = 0; i < blockSize; i++)	 		// No, let's do it!
         {
-            float32_t   rad_calc;
-            rad_calc = i;		// convert to float the current position within the buffer
-            rad_calc /= (blockSize);			// make this a fraction
-            rad_calc *= (PI * 2);			// convert to radians
-            rad_calc *= ts.multi;			// multiply by number of cycles that we want within this block (4 = 6 kHz offset)
-            //
-            sincosf(rad_calc, &adb.Osc_I_buffer[i], &adb.Osc_Q_buffer[i]);
+            float32_t rad_calc = (float32_t)i * multiplier;
+            sincosf(rad_calc, &Osc_I_buffer[i], &Osc_Q_buffer[i]);
         }
         recalculate_Osc = false;	// signal that once we have generated the quadrature sine waves, we shall not do it again
     }
@@ -1369,28 +1368,26 @@ static void AudioDriver_FreqConversion(int16_t blockSize, int16_t dir)
          **********************************************************************************/
         if(dir)
         {
-
             // this is for +Fs/4 [moves receive frequency to the left in the spectrum display]
             for(int i = 0; i < blockSize; i += 4)
             {   // xnew(0) =  xreal(0) + jximag(0)
                 // leave as it is!
                 // xnew(1) =  - ximag(1) + jxreal(1)
-                hh1 = - adb.q_buffer[i + 1];
-                hh2 =   adb.i_buffer[i + 1];
-                adb.i_buffer[i + 1] = hh1;
-                adb.q_buffer[i + 1] = hh2;
+                float32_t hh1 = - q_buffer[i + 1];
+                float32_t hh2 =   i_buffer[i + 1];
+                i_buffer[i + 1] = hh1;
+                q_buffer[i + 1] = hh2;
                 // xnew(2) = -xreal(2) - jximag(2)
-                hh1 = - adb.i_buffer[i + 2];
-                hh2 = - adb.q_buffer[i + 2];
-                adb.i_buffer[i + 2] = hh1;
-                adb.q_buffer[i + 2] = hh2;
+                hh1 = - i_buffer[i + 2];
+                hh2 = - q_buffer[i + 2];
+                i_buffer[i + 2] = hh1;
+                q_buffer[i + 2] = hh2;
                 // xnew(3) = + ximag(3) - jxreal(3)
-                hh1 =   adb.q_buffer[i + 3];
-                hh2 = - adb.i_buffer[i + 3];
-                adb.i_buffer[i + 3] = hh1;
-                adb.q_buffer[i + 3] = hh2;
+                hh1 =   q_buffer[i + 3];
+                hh2 = - i_buffer[i + 3];
+                i_buffer[i + 3] = hh1;
+                q_buffer[i + 3] = hh2;
             }
-
         }
 
         else // dir == 0
@@ -1400,47 +1397,51 @@ static void AudioDriver_FreqConversion(int16_t blockSize, int16_t dir)
             {   // xnew(0) =  xreal(0) + jximag(0)
                 // leave as it is!
                 // xnew(1) =  ximag(1) - jxreal(1)
-                hh1 = adb.q_buffer[i + 1];
-                hh2 = - adb.i_buffer[i + 1];
-                adb.i_buffer[i + 1] = hh1;
-                adb.q_buffer[i + 1] = hh2;
+                float32_t hh1 = q_buffer[i + 1];
+                float32_t hh2 = - i_buffer[i + 1];
+                i_buffer[i + 1] = hh1;
+                q_buffer[i + 1] = hh2;
                 // xnew(2) = -xreal(2) - jximag(2)
-                hh1 = - adb.i_buffer[i + 2];
-                hh2 = - adb.q_buffer[i + 2];
-                adb.i_buffer[i + 2] = hh1;
-                adb.q_buffer[i + 2] = hh2;
+                hh1 = - i_buffer[i + 2];
+                hh2 = - q_buffer[i + 2];
+                i_buffer[i + 2] = hh1;
+                q_buffer[i + 2] = hh2;
                 // xnew(3) = -ximag(3) + jxreal(3)
-                hh1 = - adb.q_buffer[i + 3];
-                hh2 = adb.i_buffer[i + 3];
-                adb.i_buffer[i + 3] = hh1;
-                adb.q_buffer[i + 3] = hh2;
+                hh1 = - q_buffer[i + 3];
+                hh2 = i_buffer[i + 3];
+                i_buffer[i + 3] = hh1;
+                q_buffer[i + 3] = hh2;
             }
-
         }
     }
     else  // frequency translation +6kHz or -6kHz
     {
+        float32_t c_buffer[blockSize];
+        float32_t d_buffer[blockSize];
+        float32_t e_buffer[blockSize];
+        float32_t f_buffer[blockSize];
+
         // Do frequency conversion using optimized ARM math functions [KA7OEI]
-        arm_mult_f32(adb.q_buffer, adb.Osc_Q_buffer, adb.c_buffer, blockSize); // multiply products for converted I channel
-        arm_mult_f32(adb.i_buffer, adb.Osc_I_buffer, adb.d_buffer, blockSize);
-        arm_mult_f32(adb.q_buffer, adb.Osc_I_buffer, adb.e_buffer, blockSize);
-        arm_mult_f32(adb.i_buffer, adb.Osc_Q_buffer, adb.f_buffer, blockSize);    // multiply products for converted Q channel
+        arm_mult_f32(q_buffer, Osc_Q_buffer, c_buffer, blockSize); // multiply products for converted I channel
+        arm_mult_f32(i_buffer, Osc_I_buffer, d_buffer, blockSize);
+        arm_mult_f32(q_buffer, Osc_I_buffer, e_buffer, blockSize);
+        arm_mult_f32(i_buffer, Osc_Q_buffer, f_buffer, blockSize);    // multiply products for converted Q channel
 
         if(!dir)	 	// Conversion is "above" on RX (LO needs to be set lower)
         {
-            arm_add_f32(adb.f_buffer, adb.e_buffer, adb.i_buffer, blockSize);	// summation for I channel
-            arm_sub_f32(adb.c_buffer, adb.d_buffer, adb.q_buffer, blockSize);	// difference for Q channel
+            arm_add_f32(f_buffer, e_buffer, i_buffer, blockSize);	// summation for I channel
+            arm_sub_f32(c_buffer, d_buffer, q_buffer, blockSize);	// difference for Q channel
         }
         else	 	// Conversion is "below" on RX (LO needs to be set higher)
         {
-            arm_add_f32(adb.c_buffer, adb.d_buffer, adb.q_buffer, blockSize);	// summation for I channel
-            arm_sub_f32(adb.f_buffer, adb.e_buffer, adb.i_buffer, blockSize);	// difference for Q channel
+            arm_add_f32(c_buffer, d_buffer, q_buffer, blockSize);	// summation for I channel
+            arm_sub_f32(f_buffer, e_buffer, i_buffer, blockSize);	// difference for Q channel
         }
     }
 }
 
 #ifdef USE_FREEDV
-static bool AudioDriver_RxProcessorFreeDV (AudioSample_t * const src, AudioSample_t * const dst, int16_t blockSize)
+static bool AudioDriver_RxProcessorFreeDV (AudioSample_t * const src, float32_t * const dst, int16_t blockSize)
 {
     // Freedv Test DL2FW
     static int16_t outbuff_count = -3;  //set to -3 since we simulate that we start with history
@@ -1457,7 +1458,7 @@ static bool AudioDriver_RxProcessorFreeDV (AudioSample_t * const src, AudioSampl
     // let the normal processing happen
 
 
-    if (ts.digital_mode==1)
+    if (ts.digital_mode == DigitalMode_FreeDV)
     { //we are in freedv-mode
 
 
@@ -1540,14 +1541,14 @@ static bool AudioDriver_RxProcessorFreeDV (AudioSample_t * const src, AudioSampl
 
 #if 0	    // activate IIR FIlter
 
-            arm_fill_f32(0,adb.b_buffer,blockSize);
+            arm_fill_f32(0,dst,blockSize);
 
             // UPSAMPLING [by hand]
             for (int j = 0; j < blockSize; j++) //  now we are doing upsampling by 6
             {
                 if (modulus_MOD == 0) // put in sample pair
                 {
-                    adb.b_buffer[j] = out_buffer->samples[outbuff_count]; // + (sample_delta.real * (float32_t)modulus_MOD);
+                    dst[j] = out_buffer->samples[outbuff_count]; // + (sample_delta.real * (float32_t)modulus_MOD);
                     //sample_delta = (out_buffer->samples[outbuff_count]-last_sample)/6;
                 }
 
@@ -1559,7 +1560,7 @@ static bool AudioDriver_RxProcessorFreeDV (AudioSample_t * const src, AudioSampl
                     // or keep the last sample value - like a sample an' old
                 {
                     //adb.b_buffer[j] = 0;
-                    adb.b_buffer[j] = out_buffer->samples[outbuff_count];
+                    dst[j] = out_buffer->samples[outbuff_count];
                 }
 #endif
 
@@ -1581,9 +1582,9 @@ static bool AudioDriver_RxProcessorFreeDV (AudioSample_t * const src, AudioSampl
             // hopefully a polyphase interpolation filter - has to be adopted to our upsampling rate and buffersizes.....
 
             // Filter below uses the TX-"Tenor" filter shape for the RX upsampling filter
-            arm_iir_lattice_f32(&IIR_FreeDV_RX_Filter, adb.b_buffer,adb.b_buffer, blockSize);
+            arm_iir_lattice_f32(&IIR_FreeDV_RX_Filter, dst, dst, blockSize);
 
-            //AudioDriver_tx_filter_audio(true,false, adb.b_buffer,adb.b_buffer, blockSize);
+            //AudioDriver_tx_filter_audio(true,false, dst, dst, blockSize);
 
 
         }
@@ -1591,7 +1592,7 @@ static bool AudioDriver_RxProcessorFreeDV (AudioSample_t * const src, AudioSampl
         {
             profileEvent(FreeDVTXUnderrun);
             // in case of underrun -> produce silence
-            arm_fill_f32(0,adb.b_buffer,blockSize);
+            arm_fill_f32(0, dst, blockSize);
         }
 
         if (outbuff_count >= FDV_BUFFER_SIZE)
@@ -1613,7 +1614,7 @@ static bool AudioDriver_RxProcessorFreeDV (AudioSample_t * const src, AudioSampl
         {
             if (outbuff_count >=0)  // here we are not at an block-overlapping region
             {
-                adb.b_buffer[j]=
+                dst[j]=
                         FreeDV_FIR_interpolate[5-mod_count]*out_buffer->samples[outbuff_count] +
                         FreeDV_FIR_interpolate[11-mod_count]*out_buffer->samples[outbuff_count+1]+
                         FreeDV_FIR_interpolate[17-mod_count]*out_buffer->samples[outbuff_count+2]+
@@ -1625,7 +1626,7 @@ static bool AudioDriver_RxProcessorFreeDV (AudioSample_t * const src, AudioSampl
                 //we are at an overlapping region and have to take care of history
                 if (outbuff_count == -3)
                 {
-                    adb.b_buffer[j] =
+                    dst[j] =
                             FreeDV_FIR_interpolate[5-mod_count] * History[0] +
                             FreeDV_FIR_interpolate[11-mod_count] * History[1] +
                             FreeDV_FIR_interpolate[17-mod_count] * History[2] +
@@ -1635,7 +1636,7 @@ static bool AudioDriver_RxProcessorFreeDV (AudioSample_t * const src, AudioSampl
                 {
                     if (outbuff_count == -2)
                     {
-                        adb.b_buffer[j] =
+                        dst[j] =
                                 FreeDV_FIR_interpolate[5-mod_count] * History[1] +
                                 FreeDV_FIR_interpolate[11-mod_count] * History[2] +
                                 FreeDV_FIR_interpolate[17-mod_count] * out_buffer->samples[0] +
@@ -1643,7 +1644,7 @@ static bool AudioDriver_RxProcessorFreeDV (AudioSample_t * const src, AudioSampl
                     }
                     else
                     {
-                        adb.b_buffer[j] =
+                        dst[j] =
                                 FreeDV_FIR_interpolate[5-mod_count] * History[2] +
                                 FreeDV_FIR_interpolate[11-mod_count] * out_buffer->samples[0] +
                                 FreeDV_FIR_interpolate[17-mod_count] * out_buffer->samples[1] +
@@ -1665,7 +1666,7 @@ static bool AudioDriver_RxProcessorFreeDV (AudioSample_t * const src, AudioSampl
     {
         profileEvent(FreeDVTXUnderrun);
         // in case of underrun -> produce silence
-        arm_fill_f32(0,adb.b_buffer,blockSize);
+        arm_fill_f32(0, dst, blockSize);
     }
 
     // we used now FDV_BUFFER_SIZE samples (3 from History[], plus FDV_BUFFER_SIZE -3 from out_buffer->samples[])
@@ -1752,6 +1753,24 @@ float32_t hang_level;
 float32_t hang_backmult;
 float32_t onemhang_backmult;
 float32_t hang_decay_mult;
+
+// RTTY Experiment based on code from the DSP Tutorial at http://dp.nonoo.hu/projects/ham-dsp-tutorial/18-rtty-decoder-using-iir-filters/
+// Used with permission from Norbert Varga, HA2NON under GPLv3 license
+
+/*
+ * Experimental Code
+ */
+#ifdef USE_RTTY_PROCESSOR
+static void AudioDriver_RxProcessor_Rtty(float32_t * const src, int16_t blockSize)
+{
+
+    for (uint16_t idx = 0; idx < blockSize; idx++)
+    {
+        RttyDecoder_ProcessSample(src[idx]);
+    }
+}
+// END RTTY Experiment
+#endif
 
 void AudioDriver_SetupAGC()
 {
@@ -2230,287 +2249,263 @@ static void AudioDriver_RxAgcProcessor(int16_t blockSize)
 static void AudioDriver_DemodFM(int16_t blockSize)
 {
 
-    float r, s, angle, x, y, a, b;
-    ulong i;
-    bool tone_det_enabled;
-    static float i_prev, q_prev, lpf_prev, hpf_prev_a, hpf_prev_b;		// used in FM detection and low/high pass processing
-    static float gr[3] = {0, 0, 0 };
-    static float gs[3] = {0, 0, 0 };
-    static float gq[3] = {0, 0, 0 }; // Goertzel values
+	float r, s, angle, x, y, a, b;
+	float32_t goertzel_buf[blockSize], squelch_buf[blockSize];
+	ulong i;
+	bool tone_det_enabled;
+	static float i_prev, q_prev, lpf_prev, hpf_prev_a, hpf_prev_b;// used in FM detection and low/high pass processing
 
-    static float subdet = 0;				// used for tone detection
-    static uchar	count = 0, tdet = 0;	// used for squelch processing and debouncing tone detection, respectively
-    static ulong	gcount = 0;				// used for averaging in tone detection
+	static float subdet = 0;				// used for tone detection
+	static uchar count = 0, tdet = 0;// used for squelch processing and debouncing tone detection, respectively
+	static ulong gcount = 0;			// used for averaging in tone detection
 
-    if(!ts.iq_freq_mode)	// bail out if translate mode is not active
-        return;
+	if (ts.iq_freq_mode != FREQ_IQ_CONV_MODE_OFF)// bail out if translate mode is not active
+	{
+
+		tone_det_enabled = ts.fm_subaudible_tone_det_select ? 1 : 0;// set a quick flag for checking to see if tone detection is enabled
+
+		for (i = 0; i < blockSize; i++)
+		{
+			// first, calculate "x" and "y" for the arctan2, comparing the vectors of present data with previous data
+
+			y = (i_prev * adb.q_buffer[i]) - (adb.i_buffer[i] * q_prev);
+			x = (i_prev * adb.i_buffer[i]) + (adb.q_buffer[i] * q_prev);
+
+			/*        //
+			 // What follows is adapted from "Fixed-Point Atan2 With Self Normalization", public domain code by "Jim Shima".
+			 // The result is "approximate" - but plenty good enough for speech-grade communications!
+			 //
+			 // Do calculation of arc-tangent (with quadrant preservation) of of I and Q channels, comparing with previous sample.
+			 // Because the result is absolute (we are using ratios!) there is no need to apply any sort of amplitude limiting
+			 //
+			 abs_y = fabs(y) + 2e-16;		// prevent us from taking "zero divided by zero" (indeterminate value) by setting this to be ALWAYS at least slightly higher than zero
+			 //
+			 if(x >= 0)	 					// Quadrant 1 or 4
+			 {
+			 r = (x - abs_y) / (x + abs_y);
+			 angle = FM_DEMOD_COEFF1 - FM_DEMOD_COEFF1 * r;
+			 }
+			 else	 						// Quadrant 2 or 3
+			 {
+			 r = (x + abs_y) / abs_y - x;
+			 angle = FM_DEMOD_COEFF2 - FM_DEMOD_COEFF1 * r;
+			 }
+			 //
+			 if (y < 0)						// Quadrant 3 or 4 - flip sign
+			 {
+			 angle = -angle;
+			 }
+
+			 */
+			angle = atan2f(y, x);
+
+			// we now have our audio in "angle"
+			squelch_buf[i] = angle;	// save audio in "d" buffer for squelch noise filtering/detection - done later
+
+			// Now do integrating low-pass filter to do FM de-emphasis
+			a = lpf_prev + (FM_RX_LPF_ALPHA * (angle - lpf_prev));	//
+			lpf_prev = a;			// save "[n-1]" sample for next iteration
+
+			goertzel_buf[i] = a;	// save in "c" for subaudible tone detection
+
+			if (((!ads.fm_squelched) && (!tone_det_enabled))
+					|| ((ads.fm_subaudible_tone_detected) && (tone_det_enabled))
+					|| ((!ts.fm_sql_threshold)))// high-pass audio only if we are un-squelched (to save processor time)
+			{
+
+				// Do differentiating high-pass filter to attenuate very low frequency audio components, namely subadible tones and other "speaker-rattling" components - and to remove any DC that might be present.
+				b = FM_RX_HPF_ALPHA * (hpf_prev_b + a - hpf_prev_a);// do differentiation
+				hpf_prev_a = a;		// save "[n-1]" samples for next iteration
+				hpf_prev_b = b;
+				//
+				adb.a_buffer[i] = b;// save demodulated and filtered audio in main audio processing buffer
+			}
+			else if ((ads.fm_squelched)
+					|| ((!ads.fm_subaudible_tone_detected) && (tone_det_enabled)))// were we squelched or tone NOT detected?
+			{
+				adb.a_buffer[i] = 0;// do not filter receive audio - fill buffer with zeroes to mute it
+			}
+
+			q_prev = adb.q_buffer[i];// save "previous" value of each channel to allow detection of the change of angle in next go-around
+			i_prev = adb.i_buffer[i];
+		}
+
+		if (!ts.agc_wdsp)
+		{
+			//
+			ads.am_fm_agc = sqrtf(
+					(q_prev * q_prev) + (i_prev * i_prev)) * FM_AGC_SCALING;// calculate amplitude of carrier to use for AGC indication only (we need it for nothing else!)
+			//
+			// Do "AGC" on FM signal:  Calculate/smooth signal level ONLY - no need for audio scaling
+			//
+			ads.agc_calc = ads.am_fm_agc * ads.agc_val;
+			//
+			if (ads.agc_calc < ads.agc_knee)// is audio below AGC "knee" value?
+			{
+				ads.agc_var = ads.agc_knee - ads.agc_calc;// calculate difference between agc value and "knee" value
+				ads.agc_var /= ads.agc_knee;// calculate ratio of difference between knee value and this value
+				ads.agc_val += ads.agc_val * AGC_DECAY_FM * ads.agc_var;// Yes - Increase gain for AGC DECAY (always fast in FM)
+			}
+			else
+			{
+				ads.agc_var = ads.agc_calc - ads.agc_knee;// calculate difference between agc value and "knee" value
+				ads.agc_var /= ads.agc_knee;// calculate ratio of difference between knee value and this value
+				ads.agc_val -= ads.agc_val * AGC_ATTACK_FM * ads.agc_var;// Fast attack to increase attenuation (do NOT scale w/decimation or else oscillation results)
+				if (ads.agc_val <= AGC_VAL_MIN)	// Prevent zero or "negative" gain values
+				{
+					ads.agc_val = AGC_VAL_MIN;
+				}
+			}
+			if (ads.agc_val >= ads.agc_rf_gain)	// limit AGC to reasonable values when low/no signals present
+			{
+				ads.agc_val = ads.agc_rf_gain;
+				if (ads.agc_val >= ads.agc_val_max)	// limit maximum gain under no-signal conditions
+				{
+					ads.agc_val = ads.agc_val_max;
+				}
+			}
+		}
 
 
-    if(ts.fm_subaudible_tone_det_select)		// set a quick flag for checking to see if tone detection is enabled
-        tone_det_enabled = 1;					// the tone decode value was nonzero - decoding is enabled
-    else
-        tone_det_enabled = 0;					// decoding is not enabled
+		// *** Squelch Processing ***
+		arm_iir_lattice_f32(&IIR_Squelch_HPF, squelch_buf, squelch_buf,
+				blockSize);	// Do IIR high-pass filter on audio so we may detect squelch noise energy
 
+		ads.fm_sql_avg = ((1 - FM_RX_SQL_SMOOTHING) * ads.fm_sql_avg)
+				+ (FM_RX_SQL_SMOOTHING * sqrtf(fabs(squelch_buf[0])));// IIR filter squelch energy magnitude:  We need look at only one representative sample
 
-    for(i = 0; i < blockSize; i++)
-    {
-        //
-        // first, calculate "x" and "y" for the arctan2, comparing the vectors of present data with previous data
-        //
-        y = (i_prev * adb.q_buffer[i]) - (adb.i_buffer[i] * q_prev);
-        x = (i_prev * adb.i_buffer[i]) + (adb.q_buffer[i] * q_prev);
-        /*        //
-        // What follows is adapted from "Fixed-Point Atan2 With Self Normalization", public domain code by "Jim Shima".
-        // The result is "approximate" - but plenty good enough for speech-grade communications!
-        //
-        // Do calculation of arc-tangent (with quadrant preservation) of of I and Q channels, comparing with previous sample.
-        // Because the result is absolute (we are using ratios!) there is no need to apply any sort of amplitude limiting
-        //
-        abs_y = fabs(y) + 2e-16;		// prevent us from taking "zero divided by zero" (indeterminate value) by setting this to be ALWAYS at least slightly higher than zero
-        //
-        if(x >= 0)	 					// Quadrant 1 or 4
-        {
-            r = (x - abs_y) / (x + abs_y);
-            angle = FM_DEMOD_COEFF1 - FM_DEMOD_COEFF1 * r;
-        }
-        else	 						// Quadrant 2 or 3
-        {
-            r = (x + abs_y) / abs_y - x;
-            angle = FM_DEMOD_COEFF2 - FM_DEMOD_COEFF1 * r;
-        }
-        //
-        if (y < 0)						// Quadrant 3 or 4 - flip sign
-        {
-            angle = -angle;
-        }
+		//
+		// Squelch processing
+		//
+		// Determine if the (averaged) energy in "ads.fm_sql_avg" is above or below the squelch threshold
+		//
+		if (count == 0)	// do the squelch threshold calculation much less often than we are called to process this audio
+		{
+			if (ads.fm_sql_avg > 0.175)	// limit maximum noise value in averaging to keep it from going out into the weeds under no-signal conditions (higher = noisier)
+			{
+				ads.fm_sql_avg = 0.175;
+			}
 
-         */
-        angle = atan2f(y,x);
-        //
-        // we now have our audio in "angle"
-        //
-        adb.d_buffer[i] = angle;		// save audio in "d" buffer for squelch noise filtering/detection - done later
-        //
-        // Now do integrating low-pass filter to do FM de-emphasis
-        //
-        a = lpf_prev + (FM_RX_LPF_ALPHA * (angle - lpf_prev));	//
-        lpf_prev = a;			// save "[n-1]" sample for next iteration
-        //
-        adb.c_buffer[i] = a;	// save in "c" for subaudible tone detection
-        //
-        if(((!ads.fm_squelched) && (!tone_det_enabled)) || ((ads.fm_subaudible_tone_detected) && (tone_det_enabled)) || ((!ts.fm_sql_threshold)))	 	// high-pass audio only if we are un-squelched (to save processor time)
-        {
-            //
-            // Do differentiating high-pass filter to attenuate very low frequency audio components, namely subadible tones and other "speaker-rattling" components - and to remove any DC that might be present.
-            //
-            b = FM_RX_HPF_ALPHA * (hpf_prev_b + a - hpf_prev_a);	// do differentiation
-            hpf_prev_a = a;		// save "[n-1]" samples for next iteration
-            hpf_prev_b = b;
-            //
-            adb.a_buffer[i] = b;	// save demodulated and filtered audio in main audio processing buffer
-        }
-        else if((ads.fm_squelched) || ((!ads.fm_subaudible_tone_detected) && (tone_det_enabled)))	 		// were we squelched or tone NOT detected?
-        {
-            adb.a_buffer[i] = 0;	// do not filter receive audio - fill buffer with zeroes to mute it
-        }
-        //
-        q_prev = adb.q_buffer[i];		// save "previous" value of each channel to allow detection of the change of angle in next go-around
-        i_prev = adb.i_buffer[i];
-    }
-    if(!ts.agc_wdsp)
-    {
-        //
-        ads.am_fm_agc = sqrtf((q_prev * q_prev) + (i_prev * i_prev)) * FM_AGC_SCALING;		// calculate amplitude of carrier to use for AGC indication only (we need it for nothing else!)
-        //
-        // Do "AGC" on FM signal:  Calculate/smooth signal level ONLY - no need for audio scaling
-        //
-        ads.agc_calc = ads.am_fm_agc * ads.agc_val;
-        //
-        if(ads.agc_calc < ads.agc_knee)	 	// is audio below AGC "knee" value?
-        {
-            ads.agc_var = ads.agc_knee - ads.agc_calc;	// calculate difference between agc value and "knee" value
-            ads.agc_var /= ads.agc_knee;	// calculate ratio of difference between knee value and this value
-            ads.agc_val += ads.agc_val* AGC_DECAY_FM * ads.agc_var;	// Yes - Increase gain for AGC DECAY (always fast in FM)
-        }
-        else
-        {
-            ads.agc_var = ads.agc_calc - ads.agc_knee;	// calculate difference between agc value and "knee" value
-            ads.agc_var /= ads.agc_knee;	// calculate ratio of difference between knee value and this value
-            ads.agc_val -= ads.agc_val * AGC_ATTACK_FM * ads.agc_var;	// Fast attack to increase attenuation (do NOT scale w/decimation or else oscillation results)
-            if(ads.agc_val <= AGC_VAL_MIN)	// Prevent zero or "negative" gain values
-            {
-                ads.agc_val = AGC_VAL_MIN;
-            }
-        }
-        if(ads.agc_val >= ads.agc_rf_gain)	 	// limit AGC to reasonable values when low/no signals present
-        {
-            ads.agc_val = ads.agc_rf_gain;
-            if(ads.agc_val >= ads.agc_val_max)	// limit maximum gain under no-signal conditions
-            {
-                ads.agc_val = ads.agc_val_max;
-            }
-        }
-    }
-    //
-    // *** Squelch Processing ***
-    //
-    arm_iir_lattice_f32(&IIR_Squelch_HPF, adb.d_buffer, adb.d_buffer, blockSize);		// Do IIR high-pass filter on audio so we may detect squelch noise energy
-    //
-    ads.fm_sql_avg = ((1 - FM_RX_SQL_SMOOTHING) * ads.fm_sql_avg) + (FM_RX_SQL_SMOOTHING * sqrtf(fabs(adb.d_buffer[0])));	// IIR filter squelch energy magnitude:  We need look at only one representative sample
+			b = ads.fm_sql_avg * 172;// scale noise amplitude to range of squelch setting
 
-    //
-    // Squelch processing
-    //
-    // Determine if the (averaged) energy in "ads.fm_sql_avg" is above or below the squelch threshold
-    //
-    if(count == 0)	 		// do the squelch threshold calculation much less often than we are called to process this audio
-    {
-        if(ads.fm_sql_avg > 0.175)		// limit maximum noise value in averaging to keep it from going out into the weeds under no-signal conditions (higher = noisier)
-        {
-            ads.fm_sql_avg = 0.175;
-        }
+			if (b > 24)						// limit noise amplitude range
+			{
+				b = 24;
+			}
+			//
+			b = 22 - b;	// "invert" the noise power so that high number now corresponds with quieter signal:  "b" may now be compared with squelch setting
+			//
+			// Now evaluate noise power with respect to squelch setting
+			//
+			if (!ts.fm_sql_threshold)	 	// is squelch set to zero?
+			{
+				ads.fm_squelched = false;		// yes, the we are un-squelched
+			}
+			else if (ads.fm_squelched)	 	// are we squelched?
+			{
+				if (b >= (float) (ts.fm_sql_threshold + FM_SQUELCH_HYSTERESIS))	// yes - is average above threshold plus hysteresis?
+				{
+					ads.fm_squelched = false;		//  yes, open the squelch
+				}
+			}
+			else	 	// is the squelch open (e.g. passing audio)?
+			{
+				if (ts.fm_sql_threshold > FM_SQUELCH_HYSTERESIS)// is setting higher than hysteresis?
+				{
+					if (b
+							< (float) (ts.fm_sql_threshold
+									- FM_SQUELCH_HYSTERESIS))// yes - is average below threshold minus hysteresis?
+					{
+						ads.fm_squelched = true;	// yes, close the squelch
+					}
+				}
+				else	 // setting is lower than hysteresis so we can't use it!
+				{
+					if (b < (float) ts.fm_sql_threshold)// yes - is average below threshold?
+					{
+						ads.fm_squelched = true;	// yes, close the squelch
+					}
+				}
+			}
+			//
+			count++;// bump count that controls how often the squelch threshold is checked
+			count &= FM_SQUELCH_PROC_DECIMATION;	// enforce the count limit
+		}
 
-        b = ads.fm_sql_avg * 172;		// scale noise amplitude to range of squelch setting
+		//
+		// *** Subaudible tone detection ***
+		//
+		if (tone_det_enabled)// is subaudible tone detection enabled?  If so, do decoding
+		{
+			//
+			// Use Goertzel algorithm for subaudible tone detection
+			//
+			// We will detect differentially at three frequencies:  Above, below and on-frequency.  The two former will be used to provide a sample of the total energy
+			// present as well as improve nearby-frequency discrimination.  By dividing the on-frequency energy with the averaged off-frequency energy we'll
+			// get a ratio that is irrespective of the actual detected audio amplitude:  A ratio of 1.00 is considered "neutral" and it goes above unity with the increasing
+			// likelihood that a tone was present on the target frequency
+			//
+			// Goertzel constants for the three decoders are pre-calculated in the function "UiCalcSubaudibleDetFreq()"
+			//
+			// (Yes, I know that below could be rewritten to be a bit more compact-looking, but it would not be much faster and it would be less-readable)
+			//
+			// Note that the "c" buffer contains audio that is somewhat low-pass filtered by the integrator, above
+			//
+			gcount++;// this counter is used for the accumulation of data over multiple cycles
+			//
+			for (i = 0; i < blockSize; i++)
+			{
 
-        if(b > 24)						// limit noise amplitude range
-        {
-            b = 24;
-        }
-        //
-        b = 22-b;						// "invert" the noise power so that high number now corresponds with quieter signal:  "b" may now be compared with squelch setting
-        //
-        // Now evaluate noise power with respect to squelch setting
-        //
-        if(!ts.fm_sql_threshold)	 	// is squelch set to zero?
-        {
-            ads.fm_squelched = false;		// yes, the we are un-squelched
-        }
-        else if(ads.fm_squelched)	 	// are we squelched?
-        {
-            if(b >= (float)(ts.fm_sql_threshold + FM_SQUELCH_HYSTERESIS))		// yes - is average above threshold plus hysteresis?
-            {
-                ads.fm_squelched = false;		//  yes, open the squelch
-            }
-        }
-        else	 	// is the squelch open (e.g. passing audio)?
-        {
-            if(ts.fm_sql_threshold > FM_SQUELCH_HYSTERESIS)	 				// is setting higher than hysteresis?
-            {
-                if(b < (float)(ts.fm_sql_threshold - FM_SQUELCH_HYSTERESIS))		// yes - is average below threshold minus hysteresis?
-                {
-                    ads.fm_squelched = true;		// yes, close the squelch
-                }
-            }
-            else	 				// setting is lower than hysteresis so we can't use it!
-            {
-                if(b < (float)ts.fm_sql_threshold)		// yes - is average below threshold?
-                {
-                    ads.fm_squelched = true;		// yes, close the squelch
-                }
-            }
-        }
-        //
-        count++;		// bump count that controls how often the squelch threshold is checked
-        count &= FM_SQUELCH_PROC_DECIMATION;	// enforce the count limit
-    }
+				// Detect above target frequency
+				AudioFilter_GoertzelInput(&ads.fm_goertzel[FM_HIGH],goertzel_buf[i]);
+				// Detect energy below target frequency
+				AudioFilter_GoertzelInput(&ads.fm_goertzel[FM_LOW],goertzel_buf[i]);
+				// Detect on-frequency energy
+				AudioFilter_GoertzelInput(&ads.fm_goertzel[FM_CTR],goertzel_buf[i]);
+			}
 
-    //
-    // *** Subaudible tone detection ***
-    //
-    if(tone_det_enabled)	 		// is subaudible tone detection enabled?  If so, do decoding
-    {
-        //
-        // Use Goertzel algorithm for subaudible tone detection
-        //
-        // We will detect differentially at three frequencies:  Above, below and on-frequency.  The two former will be used to provide a sample of the total energy
-        // present as well as improve nearby-frequency discrimination.  By dividing the on-frequency energy with the averaged off-frequency energy we'll
-        // get a ratio that is irrespective of the actual detected audio amplitude:  A ratio of 1.00 is considered "neutral" and it goes above unity with the increasing
-        // likelihood that a tone was present on the target frequency
-        //
-        // Goertzel constants for the three decoders are pre-calculated in the function "UiCalcSubaudibleDetFreq()"
-        //
-        // (Yes, I know that below could be rewritten to be a bit more compact-looking, but it would not be much faster and it would be less-readable)
-        //
-        // Note that the "c" buffer contains audio that is somewhat low-pass filtered by the integrator, above
-        //
-        gcount++;		// this counter is used for the accumulation of data over multiple cycles
-        //
-        for(i = 0; i < blockSize; i++)
-        {
+			if (gcount >= FM_SUBAUDIBLE_GOERTZEL_WINDOW)// have we accumulated enough samples to do the final energy calculation?
+			{
+				s = AudioFilter_GoertzelEnergy(&ads.fm_goertzel[FM_HIGH]) + AudioFilter_GoertzelEnergy(&ads.fm_goertzel[FM_LOW]);
+				// sum +/- energy levels:
+				// s = "off frequency" energy reading
 
-            // Detect above target frequency
-            gr[0] = ads.fm_goertzel[FM_HIGH].r * gr[1] - gr[2] + adb.c_buffer[i];		// perform Goertzel function on audio in "c" buffer
-            gr[2] = gr[1];
-            gr[1] = gr[0];
+				r = AudioFilter_GoertzelEnergy(&ads.fm_goertzel[FM_CTR]);
+				subdet = ((1 - FM_TONE_DETECT_ALPHA) * subdet)
+						+ (r / (s / 2) * FM_TONE_DETECT_ALPHA);	// do IIR filtering of the ratio between on and off-frequency energy
 
-            // Detect energy below target frequency
-            gs[0] = ads.fm_goertzel[FM_LOW].r * gs[1] - gs[2] + adb.c_buffer[i];		// perform Goertzel function on audio in "c" buffer
-            gs[2] = gs[1];
-            gs[1] = gs[0];
+				if (subdet > FM_SUBAUDIBLE_TONE_DET_THRESHOLD)// is subaudible tone detector ratio above threshold?
+				{
+					tdet++;	// yes - increment count			// yes - bump debounce count
+					if (tdet > FM_SUBAUDIBLE_DEBOUNCE_MAX)// is count above the maximum?
+					{
+						tdet = FM_SUBAUDIBLE_DEBOUNCE_MAX;// yes - limit the count
+					}
+				}
+				else	 	// it is below the threshold - reduce the debounce
+				{
+					if (tdet)		// - but only if already nonzero!
+					{
+						tdet--;
+					}
+				}
+				if (tdet >= FM_SUBAUDIBLE_TONE_DEBOUNCE_THRESHOLD)// are we above the debounce threshold?
+				{
+					ads.fm_subaudible_tone_detected = 1;// yes - a tone has been detected
+				}
+				else									// not above threshold
+				{
+					ads.fm_subaudible_tone_detected = 0;	// no tone detected
+				}
 
-            // Detect on-frequency energy
-            gq[0] = ads.fm_goertzel[FM_CTR].r * gq[1] - gq[2] + adb.c_buffer[i];
-            gq[2] = gq[1];
-            gq[1] = gq[0];
-        }
-
-        if(gcount >= FM_SUBAUDIBLE_GOERTZEL_WINDOW)	 		// have we accumulated enough samples to do the final energy calculation?
-        {
-            a = (gr[1]-(gr[2] * ads.fm_goertzel[FM_HIGH].cos));								// yes - calculate energy at frequency above center and reset detection
-            b = (gr[2] * ads.fm_goertzel[FM_HIGH].sin);
-            r = sqrtf(a*a + b*b);
-            s = r;
-            gr[0] = 0;
-            gr[1] = 0;
-            gr[2] = 0;
-
-            a = (gs[1]-(gs[2] * ads.fm_goertzel[FM_LOW].cos));								// yes - calculate energy at frequency below center and reset detection
-            b = (gs[2] * ads.fm_goertzel[FM_LOW].sin);
-            r = sqrtf(a*a + b*b);
-            s += r;					// sum +/- energy levels:  s = "off frequency" energy reading
-            gs[0] = 0;
-            gs[1] = 0;
-            gs[2] = 0;
-
-            a = (gq[1]-(gq[2] * ads.fm_goertzel[FM_CTR].cos));								// yes - calculate on-frequency energy and reset detection
-            b = (gq[2] * ads.fm_goertzel[FM_CTR].sin);
-            r = sqrtf(a*a + b*b);							// r contains "on-frequency" energy
-            subdet = ((1 - FM_TONE_DETECT_ALPHA) *subdet) + (r/(s/2) * FM_TONE_DETECT_ALPHA);	// do IIR filtering of the ratio between on and off-frequency energy
-            gq[0] = 0;
-            gq[1] = 0;
-            gq[2] = 0;
-
-            if(subdet > FM_SUBAUDIBLE_TONE_DET_THRESHOLD)	 	// is subaudible tone detector ratio above threshold?
-            {
-                tdet++;		// yes - increment count			// yes - bump debounce count
-                if(tdet > FM_SUBAUDIBLE_DEBOUNCE_MAX)			// is count above the maximum?
-                {
-                    tdet = FM_SUBAUDIBLE_DEBOUNCE_MAX;			// yes - limit the count
-                }
-            }
-            else	 			// it is below the threshold - reduce the debounce
-            {
-                if(tdet)		// - but only if already nonzero!
-                {
-                    tdet--;
-                }
-            }
-            if(tdet >= FM_SUBAUDIBLE_TONE_DEBOUNCE_THRESHOLD)	// are we above the debounce threshold?
-            {
-                ads.fm_subaudible_tone_detected = 1;			// yes - a tone has been detected
-            }
-            else												// not above threshold
-            {
-                ads.fm_subaudible_tone_detected = 0;			// no tone detected
-            }
-
-            gcount = 0;		// reset accumulation counter
-        }
-    }
-    else	 		// subaudible tone detection disabled
-    {
-        ads.fm_subaudible_tone_detected = 1;	// always signal that a tone is being detected if detection is disabled to enable audio gate
-    }
+				gcount = 0;		// reset accumulation counter
+			}
+		}
+		else	 		// subaudible tone detection disabled
+		{
+			ads.fm_subaudible_tone_detected = 1;// always signal that a tone is being detected if detection is disabled to enable audio gate
+		}
+	}
 }
 
 
@@ -2981,7 +2976,8 @@ static void AudioDriver_SpectrumZoomProcessSamples(const uint16_t blockSize)
             arm_fir_decimate_f32(&DECIMATE_ZOOM_FFT_Q, y_buffer, y_buffer, blockSize);
             // collect samples for spectrum display 256-point-FFT
 
-            for(int i = 0; i < blockSize/ (1<<sd.magnify); i++)
+            int16_t blockSizeDecim = blockSize/ (1<<sd.magnify);
+            for(int16_t i = 0; i < blockSizeDecim; i++)
             {
                 sd.FFT_Samples[sd.samp_ptr] = y_buffer[i];   // get floating point data for FFT for spectrum scope/waterfall display
                 sd.samp_ptr++;
@@ -3043,7 +3039,7 @@ static uint16_t modulus = 0;
  * @returns: true if digital signal should be used (no analog processing should be done), false -> analog processing maybe used
  * since no digital signal was detected.
  */
-static bool AudioDriver_RxProcessorDigital(AudioSample_t * const src, AudioSample_t * const dst, const uint16_t blockSize)
+static bool AudioDriver_RxProcessorDigital(AudioSample_t * const src, float32_t * const dst, const uint16_t blockSize)
 {
     bool retval = false;
     switch(ts.dmod_mode)
@@ -3055,7 +3051,7 @@ static bool AudioDriver_RxProcessorDigital(AudioSample_t * const src, AudioSampl
         break;
     default:
         // this is silence
-        arm_fill_f32(0.0,adb.b_buffer,blockSize);
+        arm_fill_f32(0.0,dst,blockSize);
     }
     // from here straight to final AUDIO OUT processing
     return retval;
@@ -3063,14 +3059,6 @@ static bool AudioDriver_RxProcessorDigital(AudioSample_t * const src, AudioSampl
 #endif
 
 
-//*----------------------------------------------------------------------------
-//* Function Name       : SAM_demodulation [DD4WH, december 2016]
-//* Object              : real synchronous AM demodulation with phase detector and PLL
-//* Object              :
-//* Input Parameters    : adb.i_buffer, adb.q_buffer
-//* Output Parameters   : adb.a_buffer
-//* Functions called    :
-//*----------------------------------------------------------------------------
 static float32_t AudioDriver_FadeLeveler(float32_t audio, float32_t corr)
 {
     static float32_t dc27 = 0.0;
@@ -3084,6 +3072,14 @@ static float32_t AudioDriver_FadeLeveler(float32_t audio, float32_t corr)
 }
 
 
+//*----------------------------------------------------------------------------
+//* Function Name       : SAM_demodulation [DD4WH, december 2016]
+//* Object              : real synchronous AM demodulation with phase detector and PLL
+//* Object              :
+//* Input Parameters    : adb.i_buffer, adb.q_buffer
+//* Output Parameters   : adb.a_buffer
+//* Functions called    :
+//*----------------------------------------------------------------------------
 static void AudioDriver_DemodSAM(int16_t blockSize)
 {
     //#define STAGES    7
@@ -3252,186 +3248,6 @@ static void AudioDriver_DemodSAM(int16_t blockSize)
     }
 }
 
-/*
-// help functions for Spectral Noise Blanker
-// aus lmath.c !!!
-// WDSP library, Warren Pratt
-
-//const int nnn = 4;
-
-#define nnn 4
-float32_t   zzz[(nnn-1) * 4];
-
-void dR (int n, float32_t* r, float32_t* y)
-{
-  int i, j, k;
-    float32_t alpha, beta, gamma;
-  float32_t* z; // = (double *) malloc0 ((n - 1) * sizeof (double));
-    y[0] = -r[1];
-    alpha = -r[1];
-    beta = 1.0;
-    for (k = 0; k < n - 1; k++)
-    {
-        beta *= 1.0 - alpha * alpha;
-        gamma = 0.0;
-        for (i = k + 1, j = 0; i > 0; i--, j++)
-            gamma += r[i] * y[j];
-        alpha = - (r[k + 2] + gamma) / beta;
-        for (i = 0, j = k; i <= k; i++, j--)
-            z[i] = y[i] + alpha * y[j];
-    memcpy (y, z, (k + 1) * sizeof (float32_t));
-        y[k + 1] = alpha;
-    }
-}
-
-void trI (
-    int n,
-    float32_t* r,
-    float32_t* B
-    )
-{
-    int i, j, ni, nj;
-    float32_t gamma, t, scale, b;
-  float32_t* y;// = (double *) malloc0 ((n - 1) * sizeof (double));
-  float32_t* v;// = (double *) malloc0 ((n - 1) * sizeof (double));
-    scale = 1.0 / r[0];
-    for (i = 0; i < n; i++)
-        r[i] *= scale;
-    dR(n - 1, r, y);
-
-    t = 0.0;
-    for (i = 0; i < n - 1; i++)
-        t += r[i + 1] * y[i];
-    gamma = 1.0 / (1.0 + t);
-    for (i = 0, j = n - 2; i < n - 1; i++, j--)
-        v[i] = gamma * y[j];
-    B[0] = gamma;
-    for (i = 1, j = n - 2; i < n; i++, j--)
-        B[i] = v[j];
-    for (i = 1; i <= (n - 1) / 2; i++)
-        for (j = i; j < n - i; j++)
-            B[i * n + j] = B[(i - 1) * n + (j - 1)] + (v[n - j - 1] * v[n - i - 1] - v[i - 1] * v[j - 1]) / gamma;
-    for (i = 0; i <= (n - 1)/2; i++)
-        for (j = i; j < n - i; j++)
-        {
-            b = B[i * n + j] *= scale;
-            B[j * n + i] = b;
-            ni = n - i - 1;
-            nj = n - j - 1;
-            B[ni * n + nj] = b;
-            B[nj * n + ni] = b;
-        }
-}
-
-
-void asolve(int xsize, int asize, float32_t* x, float32_t* a)
-{
-    int i, j, k;
-    float32_t beta, alpha, t;
-  float32_t* r;// = (double *) malloc0 ((asize + 1) * sizeof (double));
-  float32_t* z;// = (double *) malloc0 ((asize + 1) * sizeof (double));
-    for (i = 0; i <= asize; i++)
-    {
-    for (j = 0; j < xsize; j++)
-      r[i] += x[j] * x[j - i];
-    }
-    z[0] = 1.0;
-    beta = r[0];
-    for (k = 0; k < asize; k++)
-    {
-        alpha = 0.0;
-        for (j = 0; j <= k; j++)
-            alpha -= z[j] * r[k + 1 - j];
-        alpha /= beta;
-        for (i = 0; i <= (k + 1) / 2; i++)
-        {
-            t = z[k + 1 - i] + alpha * z[i];
-            z[i] = z[i] + alpha * z[k + 1 - i];
-            z[k + 1 - i] = t;
-        }
-        beta *= 1.0 - alpha * alpha;
-    }
-    for (i = 0; i < asize; i++)
-  {
-        a[i] = - z[i + 1];
-    if (a[i] != a[i]) a[i] = 0.0;
-  }
-}
-
-void median (int n, float32_t* a, float32_t* med)
-{
-    int S0, S1, i, j, m, k;
-    float32_t x, t;
-    S0 = 0;
-    S1 = n - 1;
-    k = n / 2;
-    while (S1 > S0 + 1)
-    {
-        m = (S0 + S1) / 2;
-        t = a[m];
-        a[m] = a[S0 + 1];
-        a[S0 + 1] = t;
-        if (a[S0] > a[S1])
-        {
-            t = a[S0];
-            a[S0] = a[S1];
-            a[S1] = t;
-        }
-        if (a[S0 + 1] > a[S1])
-        {
-            t = a[S0 + 1];
-            a[S0 + 1] = a[S1];
-            a[S1] = t;
-        }
-        if (a[S0] > a[S0 + 1])
-        {
-            t = a[S0];
-            a[S0] = a[S0 + 1];
-            a[S0 + 1] = t;
-        }
-        i = S0 + 1;
-        j = S1;
-        x = a[S0 + 1];
-    do i++; while (a[i] < x);
-        do j--; while (a[j] > x);
-        while (j >= i)
-        {
-            t = a[i];
-            a[i] = a[j];
-            a[j] = t;
-      do i++; while (a[i] < x);
-            do j--; while (a[j] > x);
-        }
-        a[S0 + 1] = a[j];
-        a[j] = x;
-        if (j >= k) S1 = j - 1;
-        if (j <= k) S0 = i;
-    }
-    if (S1 == S0 + 1 && a[S1] < a[S0])
-    {
-        t = a[S0];
-        a[S0] = a[S1];
-        a[S1] = t;
-    }
- *med = a[k];
-}
-
-
-
-void exec_SNB(uint16_t blockSize)
-{
-    if(0)
-    {
-
-
-
-    }
-}
-
- */
-
-
-
 
 float32_t sign_new (float32_t x) {
     return x < 0 ? -1.0 : ( x > 0 ? 1.0 : 0.0);
@@ -3578,9 +3394,6 @@ static void AudioDriver_RxProcessor(AudioSample_t * const src, AudioSample_t * c
     const uint8_t iq_freq_mode = ts.iq_freq_mode;
     const uint8_t  dsp_active = ts.dsp_active;
 
-
-    static int beep_idx = 0;
-
     float post_agc_gain_scaling;
 
 #ifdef alternate_NR
@@ -3588,8 +3401,8 @@ static void AudioDriver_RxProcessor(AudioSample_t * const src, AudioSample_t * c
     static int outbuff_count=0;
     static int NR_fill_in_pt=0;
     static FDV_IQ_Buffer* out_buffer = NULL;
-//#define NR_FFT_SIZE   128
-    #endif
+    //#define NR_FFT_SIZE   128
+#endif
 
 
     if (tx_audio_source == TX_AUDIO_DIGIQ)
@@ -3597,7 +3410,6 @@ static void AudioDriver_RxProcessor(AudioSample_t * const src, AudioSample_t * c
 
         for(uint32_t i = 0; i < blockSize; i++)
         {
-
             // 16 bit format - convert to float and increment
             // we collect our I/Q samples for USB transmission if TX_AUDIO_DIGIQ
             audio_in_put_buffer(src[i].l);
@@ -3673,14 +3485,7 @@ static void AudioDriver_RxProcessor(AudioSample_t * const src, AudioSample_t * c
 
         if(iq_freq_mode)            // is receive frequency conversion to be done?
         {
-            if(iq_freq_mode == FREQ_IQ_CONV_P6KHZ || iq_freq_mode == FREQ_IQ_CONV_P12KHZ)           // Yes - "RX LO LOW" mode
-            {
-                AudioDriver_FreqConversion(blockSize, 1);
-            }
-            else                                // it is in "RX LO LOW" mode
-            {
-                AudioDriver_FreqConversion(blockSize, 0);
-            }
+            AudioDriver_FreqConversion(adb.i_buffer, adb.q_buffer, blockSize, iq_freq_mode == FREQ_IQ_CONV_P6KHZ || iq_freq_mode == FREQ_IQ_CONV_P12KHZ);
         }
 
         // Spectrum display sample collect for magnify != 0
@@ -3691,14 +3496,21 @@ static void AudioDriver_RxProcessor(AudioSample_t * const src, AudioSample_t * c
         bool dvmode_signal = false;
 
 #ifdef USE_FREEDV
-        if (ts.dvmode == true)
+        if (ts.dvmode == true && ts.digital_mode == DigitalMode_FreeDV)
         {
-            dvmode_signal = AudioDriver_RxProcessorDigital(src,dst,blockSize);
+            dvmode_signal = AudioDriver_RxProcessorDigital(src, adb.b_buffer, blockSize);
         }
 #endif
 
         if (dvmode_signal == false)
         {
+            bool use_decimatedIQ =
+                    FilterPathInfo[ts.filter_path].FIR_I_coeff_file == i_rx_new_coeffs
+                    && dmod_mode != DEMOD_FM
+                    && dmod_mode != DEMOD_SAM
+                    && dmod_mode != DEMOD_AM;
+            uint16_t blockSizeIQ = use_decimatedIQ? blockSizeDecim: blockSize;
+
             // ------------------------
             // In SSB and CW - Do 0-90 degree Phase-added Hilbert Transform
             // In AM and SAM, the FIR below does ONLY low-pass filtering appropriate for the filter bandwidth selected, in
@@ -3709,56 +3521,39 @@ static void AudioDriver_RxProcessor(AudioSample_t * const src, AudioSample_t * c
             {   // FilterPathInfo[ts.filter_path].FIR_I_coeff_file == &i_rx_new_coeffs
 
                 //                if(ts.filter_path < 48 && dmod_mode != DEMOD_FM)
-                if(FilterPathInfo[ts.filter_path].FIR_I_coeff_file == i_rx_new_coeffs && dmod_mode != DEMOD_FM)
+                if(use_decimatedIQ)
                 {
-                // TODO HILBERT
-                //    FilterPathInfo[ts.filter_path].id >= 12
-                // decimation of both channels here for LSB/USB/CW, if Filter BW <= 3k6
-                arm_fir_decimate_f32(&DECIMATE_RX, adb.i_buffer, adb.i_buffer, blockSize);      // LPF built into decimation (Yes, you can decimate-in-place!)
-                arm_fir_decimate_f32(&DECIMATE_RX_Q, adb.q_buffer, adb.q_buffer, blockSize);      // LPF built into decimation (Yes, you can decimate-in-place!)
-                arm_fir_f32(&FIR_I,adb.i_buffer, adb.i_buffer,blockSizeDecim);   // in AM: lowpass filter, in other modes: Hilbert lowpass 0 degrees
-                arm_fir_f32(&FIR_Q,adb.q_buffer, adb.q_buffer,blockSizeDecim);   // in AM: lowpass filter, in other modes: Hilbert lowpass -90 degrees
+                    // TODO HILBERT
+                    //    FilterPathInfo[ts.filter_path].id >= 12
+                    // decimation of both channels here for LSB/USB/CW, if Filter BW <= 3k6
+                    arm_fir_decimate_f32(&DECIMATE_RX,   adb.i_buffer, adb.i_buffer, blockSize);      // LPF built into decimation (Yes, you can decimate-in-place!)
+                    arm_fir_decimate_f32(&DECIMATE_RX_Q, adb.q_buffer, adb.q_buffer, blockSize);      // LPF built into decimation (Yes, you can decimate-in-place!)
+                    arm_fir_f32(&FIR_I,adb.i_buffer, adb.i_buffer, blockSizeDecim);   // in AM: lowpass filter, in other modes: Hilbert lowpass 0 degrees
+                    arm_fir_f32(&FIR_Q,adb.q_buffer, adb.q_buffer, blockSizeDecim);   // in AM: lowpass filter, in other modes: Hilbert lowpass -90 degrees
                 }
                 else
                 {
-                arm_fir_f32(&FIR_I,adb.i_buffer, adb.i_buffer,blockSize);   // in AM: lowpass filter, in other modes: Hilbert lowpass 0 degrees
-                arm_fir_f32(&FIR_Q,adb.q_buffer, adb.q_buffer,blockSize);   // in AM: lowpass filter, in other modes: Hilbert lowpass -90 degrees
+                    arm_fir_f32(&FIR_I,adb.i_buffer, adb.i_buffer, blockSize);   // in AM: lowpass filter, in other modes: Hilbert lowpass 0 degrees
+                    arm_fir_f32(&FIR_Q,adb.q_buffer, adb.q_buffer, blockSize);   // in AM: lowpass filter, in other modes: Hilbert lowpass -90 degrees
                 }
             }
 
             switch(dmod_mode)
             {
             case DEMOD_LSB:
-//                if(ts.filter_path < 48)
-                if(FilterPathInfo[ts.filter_path].FIR_I_coeff_file == i_rx_new_coeffs)
-                {
-                    arm_sub_f32(adb.i_buffer, adb.q_buffer, adb.a_buffer, blockSizeDecim);   // difference of I and Q - LSB
-                }
-                else
-                {
-                    arm_sub_f32(adb.i_buffer, adb.q_buffer, adb.a_buffer, blockSize);   // difference of I and Q - LSB
-                }
+                arm_sub_f32(adb.i_buffer, adb.q_buffer, adb.a_buffer, blockSizeIQ);   // difference of I and Q - LSB
                 break;
             case DEMOD_CW:
                 if(!ts.cw_lsb)  // is this USB RX mode?  (LSB of mode byte was zero)
                 {
-                    arm_add_f32(adb.i_buffer, adb.q_buffer, adb.a_buffer, blockSizeDecim);   // sum of I and Q - USB
+                    arm_add_f32(adb.i_buffer, adb.q_buffer, adb.a_buffer, blockSizeIQ);   // sum of I and Q - USB
                 }
                 else    // No, it is LSB RX mode
                 {
-                    arm_sub_f32(adb.i_buffer, adb.q_buffer, adb.a_buffer, blockSizeDecim);   // difference of I and Q - LSB
+                    arm_sub_f32(adb.i_buffer, adb.q_buffer, adb.a_buffer, blockSizeIQ);   // difference of I and Q - LSB
                 }
                 break;
-                /*        case DEMOD_AM:
-            if (ts.AM_experiment)
-            {
-                AudioDriver_DemodAmExperimental(blockSize);
-            }
-            else
-            {
-                AudioDriver_DemodAM(blockSize);
-            }
-            break; */
+
             case DEMOD_AM:
             case DEMOD_SAM:
                 AudioDriver_DemodSAM(blockSize); // lowpass filtering, decimation, and SAM demodulation
@@ -3778,58 +3573,47 @@ static void AudioDriver_RxProcessor(AudioSample_t * const src, AudioSample_t * c
                 // using analog demodulation in the respective sideband
                 if (ts.digi_lsb)
                 {
-                    arm_sub_f32(adb.i_buffer, adb.q_buffer, adb.a_buffer, blockSize);   // difference of I and Q - LSB
+                    arm_sub_f32(adb.i_buffer, adb.q_buffer, adb.a_buffer, blockSizeIQ);   // difference of I and Q - LSB
                 }
                 else
                 {
-                    arm_add_f32(adb.i_buffer, adb.q_buffer, adb.a_buffer, blockSize);   // sum of I and Q - USB
+                    arm_add_f32(adb.i_buffer, adb.q_buffer, adb.a_buffer, blockSizeIQ);   // sum of I and Q - USB
                 }
                 break;
             case DEMOD_USB:
             default:
-//                if(ts.filter_path < 48)
-                if(FilterPathInfo[ts.filter_path].FIR_I_coeff_file == i_rx_new_coeffs)
-                {
-                    arm_add_f32(adb.i_buffer, adb.q_buffer, adb.a_buffer, blockSizeDecim);   // sum of I and Q - USB
-                }
-                else
-                {
-                    arm_add_f32(adb.i_buffer, adb.q_buffer, adb.a_buffer, blockSize);   // sum of I and Q - USB
-                }
+                arm_add_f32(adb.i_buffer, adb.q_buffer, adb.a_buffer, blockSizeIQ);   // sum of I and Q - USB
                 break;
             }
 
             if(dmod_mode != DEMOD_FM)       // are we NOT in FM mode?  If we are not, do decimation, filtering, DSP notch/noise reduction, etc.
             {
                 // Do decimation down to lower rate to reduce processor load
-                if (DECIMATE_RX.numTaps > 0 && dmod_mode != DEMOD_SAM && dmod_mode != DEMOD_AM &&
-                        !((dmod_mode == DEMOD_LSB || dmod_mode == DEMOD_USB || dmod_mode == DEMOD_CW) && FilterPathInfo[ts.filter_path].FIR_I_coeff_file == i_rx_new_coeffs)) // in SAM mode, the decimation is done in both I & Q path --> AudioDriver_Demod_SAM
+                if (    DECIMATE_RX.numTaps > 0
+                        && use_decimatedIQ == false // we did not already decimate the input earlier
+                        && dmod_mode != DEMOD_SAM
+                        && dmod_mode != DEMOD_AM) // in AM/SAM mode, the decimation has been done in both I & Q path --> AudioDriver_Demod_SAM
                 {
                     // TODO HILBERT
-
-                    // for filter BW <= 3k6 and LSB/USB/CW, don't do decimation, we are already in 12ksps
-
                     arm_fir_decimate_f32(&DECIMATE_RX, adb.a_buffer, adb.a_buffer, blockSize);      // LPF built into decimation (Yes, you can decimate-in-place!)
                 }
 
 
                 if (ts.dsp_inhibit == false)
                 {
-                    if((dsp_active & DSP_NOTCH_ENABLE) && (dmod_mode != DEMOD_CW) && !(ts.dmod_mode == DEMOD_SAM && (FilterPathInfo[ts.filter_path].sample_rate_dec) == RX_DECIMATION_RATE_24KHZ))       // No notch in CW
+                    if((dsp_active & DSP_NOTCH_ENABLE) && (dmod_mode != DEMOD_CW) && !(dmod_mode == DEMOD_SAM && (FilterPathInfo[ts.filter_path].sample_rate_dec) == RX_DECIMATION_RATE_24KHZ))       // No notch in CW
                     {
                         AudioDriver_NotchFilter(blockSizeDecim);     // Do notch filter
                     }
 
                     // DSP noise reduction using LMS (Least Mean Squared) algorithm
                     // This is the pre-filter/AGC instance
+                    if((dsp_active & DSP_NR_ENABLE) && (!(dsp_active & DSP_NR_POSTAGC_ENABLE)) && !(dmod_mode == DEMOD_SAM && (FilterPathInfo[ts.filter_path].sample_rate_dec) == RX_DECIMATION_RATE_24KHZ))      // Do this if enabled and "Pre-AGC" DSP NR enabled
+                    {
+                        AudioDriver_NoiseReduction(blockSizeDecim);
+                    }
 
-
-                        if((dsp_active & DSP_NR_ENABLE) && (!(dsp_active & DSP_NR_POSTAGC_ENABLE)) && !(ts.dmod_mode == DEMOD_SAM && (FilterPathInfo[ts.filter_path].sample_rate_dec) == RX_DECIMATION_RATE_24KHZ))      // Do this if enabled and "Pre-AGC" DSP NR enabled
-                            {
-                              AudioDriver_NoiseReduction(blockSizeDecim);
-                            }
-
-                  }
+                }
 
                 // Apply audio  bandpass filter
                 if ((IIR_PreFilter.numStages > 0))   // yes, we want an audio IIR filter
@@ -3863,7 +3647,7 @@ static void AudioDriver_RxProcessor(AudioSample_t * const src, AudioSample_t * c
                 // DSP noise reduction using LMS (Least Mean Squared) algorithm
                 // This is the post-filter, post-AGC instance
                 //
-                if((dsp_active & DSP_NR_ENABLE) && (dsp_active & DSP_NR_POSTAGC_ENABLE) && (!ts.dsp_inhibit) && !(ts.dmod_mode == DEMOD_SAM && (FilterPathInfo[ts.filter_path].sample_rate_dec) == RX_DECIMATION_RATE_24KHZ))     // Do DSP NR if enabled and if post-DSP NR enabled
+                if((dsp_active & DSP_NR_ENABLE) && (dsp_active & DSP_NR_POSTAGC_ENABLE) && (!ts.dsp_inhibit) && !(dmod_mode == DEMOD_SAM && (FilterPathInfo[ts.filter_path].sample_rate_dec) == RX_DECIMATION_RATE_24KHZ))     // Do DSP NR if enabled and if post-DSP NR enabled
                 {
                     AudioDriver_NoiseReduction(blockSizeDecim);
                 }
@@ -3871,65 +3655,65 @@ static void AudioDriver_RxProcessor(AudioSample_t * const src, AudioSample_t * c
 
                 if (ts.new_nb==true) //start of new nb
                 {
-                           // NR_in and _out buffers are using the same physical space than the freedv_iq_buffer
-                           // the freedv_iq_buffer  consist of an array of 320 complex (2*float) samples
-                           // for NR reduction we use a maximum of 256 real samples
-                           // so we use the freedv_iq buffers in a way, that we use the first half of each array for the input
-                           // and the second half for the output
-                           // .real and .imag are loosing there meaning here as they represent consecutive real samples
+                    // NR_in and _out buffers are using the same physical space than the freedv_iq_buffer
+                    // the freedv_iq_buffer  consist of an array of 320 complex (2*float) samples
+                    // for NR reduction we use a maximum of 256 real samples
+                    // so we use the freedv_iq buffers in a way, that we use the first half of each array for the input
+                    // and the second half for the output
+                    // .real and .imag are loosing there meaning here as they represent consecutive real samples
 
-                           if (ads.decimation_rate == 4)   //  to make sure, that we are at 12Ksamples
+                    if (ads.decimation_rate == 4)   //  to make sure, that we are at 12Ksamples
 
-                           {
-                             for (int k = 0; k < blockSizeDecim; k=k+2) //transfer our noisy audio to our NR-input buffer
-                             {
-                                 fdv_iq_buff[NR_fill_in_pt].samples[trans_count_in].real=adb.a_buffer[k];
-                                 fdv_iq_buff[NR_fill_in_pt].samples[trans_count_in].imag=adb.a_buffer[k+1];
-                                 //trans_count_in++;
-                                 trans_count_in++; // count the samples towards FFT-size  -  2 samples per loop
-                             }
+                    {
+                        for (int k = 0; k < blockSizeDecim; k=k+2) //transfer our noisy audio to our NR-input buffer
+                        {
+                            fdv_iq_buff[NR_fill_in_pt].samples[trans_count_in].real=adb.a_buffer[k];
+                            fdv_iq_buff[NR_fill_in_pt].samples[trans_count_in].imag=adb.a_buffer[k+1];
+                            //trans_count_in++;
+                            trans_count_in++; // count the samples towards FFT-size  -  2 samples per loop
+                        }
 
-                             if (trans_count_in >= (NR_FFT_SIZE/2))  // buffer limited to 320!! as in FreeDV used
-                                                                 //NR_FFT_SIZE has to be an integer mult. of blockSizeDecim!!!
-                             {
-                                 NR_in_buffer_add(&fdv_iq_buff[NR_fill_in_pt]); // save pointer to full buffer
-                                 trans_count_in=0;                              // set counter to 0
-                                 NR_fill_in_pt++;                               // increase pointer index
-                                 NR_fill_in_pt %= FDV_BUFFER_IQ_NUM;            // make sure, that index stays in range
+                        if (trans_count_in >= (NR_FFT_SIZE/2))  // buffer limited to 320!! as in FreeDV used
+                            //NR_FFT_SIZE has to be an integer mult. of blockSizeDecim!!!
+                        {
+                            NR_in_buffer_add(&fdv_iq_buff[NR_fill_in_pt]); // save pointer to full buffer
+                            trans_count_in=0;                              // set counter to 0
+                            NR_fill_in_pt++;                               // increase pointer index
+                            NR_fill_in_pt %= FDV_BUFFER_IQ_NUM;            // make sure, that index stays in range
 
-                                //at this point we have transfered one complete block of 128 (?) samples to one buffer
-                             }
+                            //at this point we have transfered one complete block of 128 (?) samples to one buffer
+                        }
 
-                             //**********************************************************************************
-                             //don't worry!  in the mean time the noise reduction routine is (hopefully) doing it's job within ui
-                             //as soon as "fdv_audio_has_data" we can start harvesting the output
-                             //**********************************************************************************
+                        //**********************************************************************************
+                        //don't worry!  in the mean time the noise reduction routine is (hopefully) doing it's job within ui
+                        //as soon as "fdv_audio_has_data" we can start harvesting the output
+                        //**********************************************************************************
 
-                             if (out_buffer == NULL && NR_out_has_data() > 1)
-                             {
-                                 NR_out_buffer_peek(&out_buffer);
-                             }
+                        if (out_buffer == NULL && NR_out_has_data() > 1)
+                        {
+                            NR_out_buffer_peek(&out_buffer);
+                        }
 
-                             if (out_buffer != NULL)  //NR-routine has finished it's job
-                             {
-                                 for (int j=0; j < blockSizeDecim; j=j+2) // transfer noise reduced data back to our buffer
-                                 {
-                                     adb.a_buffer[j]   = out_buffer->samples[outbuff_count+NR_FFT_SIZE].real; //here add the offset in the buffer
-                                     adb.a_buffer[j+1] = out_buffer->samples[outbuff_count+NR_FFT_SIZE].imag; //here add the offset in the buffer
-                                     outbuff_count++;
-                                     //outbuff_count++;
-                                 }
+                        if (out_buffer != NULL)  //NR-routine has finished it's job
+                        {
+                            for (int j=0; j < blockSizeDecim; j=j+2) // transfer noise reduced data back to our buffer
+                            {
+                                adb.a_buffer[j]   = out_buffer->samples[outbuff_count+NR_FFT_SIZE].real; //here add the offset in the buffer
+                                adb.a_buffer[j+1] = out_buffer->samples[outbuff_count+NR_FFT_SIZE].imag; //here add the offset in the buffer
+                                outbuff_count++;
+                                //outbuff_count++;
+                            }
 
-                                 if (outbuff_count >= (NR_FFT_SIZE/2)) // we reached the end of the buffer comming from NR
-                                 {
-                                     outbuff_count = 0;
-                                     NR_out_buffer_remove(&out_buffer);
-                                     out_buffer = NULL;
-                                     NR_out_buffer_peek(&out_buffer);
-                                 }
-                             }
+                            if (outbuff_count >= (NR_FFT_SIZE/2)) // we reached the end of the buffer comming from NR
+                            {
+                                outbuff_count = 0;
+                                NR_out_buffer_remove(&out_buffer);
+                                out_buffer = NULL;
+                                NR_out_buffer_peek(&out_buffer);
+                            }
+                        }
 
-                           }
+                    }
 
                 } // end of new nb
 
@@ -3973,10 +3757,21 @@ static void AudioDriver_RxProcessor(AudioSample_t * const src, AudioSample_t * c
                 // this is the biquad filter, a notch, peak, and lowshelf filter
                 arm_biquad_cascade_df1_f32 (&IIR_biquad_1, adb.a_buffer,adb.a_buffer, blockSizeDecim);
 
+#ifdef USE_RTTY_PROCESSOR
+                if (is_demod_rtty() && blockSizeDecim == 8) // only works when decimation rate is 4 --> sample rate == 12ksps
+                {
+                    AudioDriver_RxProcessor_Rtty(adb.a_buffer, blockSizeDecim);
+                }
+#endif
+                if(ts.cw_decoder_enable && blockSizeDecim ==8)
+                {
+                	CwDecode_RxProcessor(adb.a_buffer, blockSizeDecim);
+                }
+
                 // resample back to original sample rate while doing low-pass filtering to minimize audible aliasing effects
                 if (INTERPOLATE_RX.phaseLength > 0)
                 {
-                    arm_fir_interpolate_f32(&INTERPOLATE_RX, adb.a_buffer,(float32_t *) adb.b_buffer, blockSizeDecim);
+                    arm_fir_interpolate_f32(&INTERPOLATE_RX, adb.a_buffer, adb.b_buffer, blockSizeDecim);
                 }
                 // additional antialias filter for specific bandwidths
                 // IIR ARMA-type lattice filter
@@ -3986,7 +3781,7 @@ static void AudioDriver_RxProcessor(AudioSample_t * const src, AudioSample_t * c
                 }
 
             } // end NOT in FM mode
-            else if(ts.dmod_mode == DEMOD_FM)           // it is FM - we don't do any decimation, interpolation, filtering or any other processing - just rescale audio amplitude
+            else if(dmod_mode == DEMOD_FM)           // it is FM - we don't do any decimation, interpolation, filtering or any other processing - just rescale audio amplitude
             {
                 arm_scale_f32(
                         adb.a_buffer,
@@ -4025,16 +3820,18 @@ static void AudioDriver_RxProcessor(AudioSample_t * const src, AudioSample_t * c
     }
     else
     {
-        arm_scale_f32(adb.b_buffer, (float32_t)LINE_OUT_SCALING_FACTOR, adb.a_buffer, blockSize);       // Do fixed scaling of audio for LINE OUT and copy to "a" buffer in one operation
+        arm_scale_f32(adb.b_buffer, LINE_OUT_SCALING_FACTOR, adb.a_buffer, blockSize);       // Do fixed scaling of audio for LINE OUT and copy to "a" buffer in one operation
         //
         // AF gain in "ts.audio_gain-active"
         //  0 - 16: via codec command
         // 17 - 20: soft gain after decoder
         //
-        if(ts.rx_gain[RX_AUDIO_SPKR].value > 16)    // is volume control above highest hardware setting?
+#ifdef UI_BRD_MCHF
+        if(ts.rx_gain[RX_AUDIO_SPKR].value > CODEC_SPEAKER_MAX_VOLUME)    // is volume control above highest hardware setting?
         {
             arm_scale_f32(adb.b_buffer, (float32_t)ts.rx_gain[RX_AUDIO_SPKR].active_value, adb.b_buffer, blockSize);    // yes, do software volume control adjust on "b" buffer
         }
+#endif
     }
 
 
@@ -4048,9 +3845,8 @@ static void AudioDriver_RxProcessor(AudioSample_t * const src, AudioSample_t * c
         if((ts.beep_active) && (ads.beep.step))         // is beep active?
         {
             // Yes - Calculate next sample
-
-            beep_idx    =  softdds_step(&ads.beep); // shift accumulator to index sine table
-            adb.b_buffer[i] += (float32_t)(DDS_TABLE[beep_idx] * ads.beep_loudness_factor); // load indexed sine wave value, adding it to audio, scaling the amplitude and putting it on "b" - speaker (ONLY)
+            // shift accumulator to index sine table
+            adb.b_buffer[i] += (float32_t)softdds_nextSample(&ads.beep) * ads.beep_loudness_factor; // load indexed sine wave value, adding it to audio, scaling the amplitude and putting it on "b" - speaker (ONLY)
         }
         else                    // beep not active - force reset of accumulator to start at zero to minimize "click" caused by an abrupt voltage transition at startup
         {
@@ -4064,8 +3860,12 @@ static void AudioDriver_RxProcessor(AudioSample_t * const src, AudioSample_t * c
         }
         else
         {
-            dst[i].l = adb.b_buffer[i];        // Speaker channel (variable level)
+#ifdef USE_TWO_CHANNEL_AUDIO
+            dst[i].r = dst[i].l = adb.b_buffer[i];
+#else
+            dst[i].l = adb.b_buffer[i]; // VARIABLE LEVEL FOR SPEAKER
             dst[i].r = adb.a_buffer[i];        // LINE OUT (constant level)
+#endif
         }
         // Unless this is DIGITAL I/Q Mode, we sent processed audio
         if (tx_audio_source != TX_AUDIO_DIGIQ)
@@ -4075,6 +3875,16 @@ static void AudioDriver_RxProcessor(AudioSample_t * const src, AudioSample_t * c
             audio_in_put_buffer(val);
         }
     }
+
+    // RTTY decoder was here!
+#ifdef XUSE_RTTY_PROCESSOR
+    if (ts.enable_rtty_decode)
+    {
+        AudioDriver_RxProcessor_Rtty(adb.a_buffer, blockSize);
+    }
+#endif
+
+
     // calculate the first index we read so that we are not loosing
     // values.
     // For 1 and 2,4 we do not need to shift modulus
@@ -4091,20 +3901,16 @@ static void AudioDriver_RxProcessor(AudioSample_t * const src, AudioSample_t * c
 }
 
 
-//
-//*----------------------------------------------------------------------------
-//* Function Name       : audio_tx_compressor (look-ahead type) by KA7OEI
-//* Object              :
-//* Object              : speech compressor/processor for TX audio
-//* Input Parameters    : size of buffer to processes, gain scaling factor
-//* Input Parameters    : also processes/compresses audio in "adb.i_buffer" and "adb.q_buffer" - it looks only at data in "i" buffer
-//*                       reads adb.a_buffer as well.
-//* Output Parameters   : data via "adb.i_buffer" and "adb.q_buffer"
-//* Functions called    : none
-//*----------------------------------------------------------------------------
+/**
+ * @brief audio speech compressor (look-ahead type) by KA7OEI
+ * @param buffer input (and output) buffer for audio samples
+ * @param blockSize number of samples to process
+ * @param gain_scaling scaling applied to buffer
+ *
+ */
 static void AudioDriver_TxCompressor(float32_t* buffer, int16_t blockSize, float gain_scaling)
 {
-    static uint32_t		alc_delay_inbuf = 0, alc_delay_outbuf;
+    static uint32_t	alc_delay_inbuf = 0, alc_delay_outbuf;
 
     if (ts.tx_comp_level > -1)
     {
@@ -4112,17 +3918,13 @@ static void AudioDriver_TxCompressor(float32_t* buffer, int16_t blockSize, float
         {
             // perform post-filter gain operation
             // this is part of the compression
-            //
             float32_t gain_calc = ((float32_t)ts.alc_tx_postfilt_gain_var)/2.0 +0.5 ;
+
             // get post-filter gain setting
             // offset it so that 2 = unity
-
             arm_scale_f32(buffer, gain_calc, buffer, blockSize);      // use optimized function to apply scaling to I/Q buffers
         }
 
-
-
-        // ------------------------
         // Do ALC processing on audio buffer - look-ahead type by KA7OEI
         if (false)
         {
@@ -4186,8 +3988,18 @@ static void AudioDriver_TxCompressor(float32_t* buffer, int16_t blockSize, float
     }
 }
 
-// Equalize based on band and simultaneously apply I/Q gain AND phase adjustments
-static void AudioDriver_TxIqProcessingFinal(float scaling, bool swap, AudioSample_t* const dst, const uint16_t blockSize)
+/**
+ * @brief Equalize based on band and simultaneously apply I/Q gain AND phase adjustments
+ * The input is IQ data in the adb.i_buffer and adb.q_buffer
+ *
+ * @param dst output buffer for generated IQ audio samples
+ * @param blockSize number of samples (input/output)
+ * @param swap i and q buffers meaning
+ * @param scaling gain applied to the samples before conversion to integer data
+ *
+ */
+
+static void AudioDriver_TxIqProcessingFinal(float32_t scaling, bool swap, AudioSample_t* const dst, const uint16_t blockSize)
 {
     int16_t trans_idx;
 
@@ -4202,9 +4014,9 @@ static void AudioDriver_TxIqProcessingFinal(float scaling, bool swap, AudioSampl
 
     float32_t *final_i_buffer, *final_q_buffer;
 
-    float32_t final_i_gain = (float32_t)(ts.tx_power_factor * ts.tx_adj_gain_var[trans_idx].i * scaling);
-    float32_t final_q_gain = (float32_t)(ts.tx_power_factor * ts.tx_adj_gain_var[trans_idx].q * scaling);
-    // ------------------------
+    float32_t final_i_gain = ts.tx_power_factor * ts.tx_adj_gain_var[trans_idx].i * scaling;
+    float32_t final_q_gain = ts.tx_power_factor * ts.tx_adj_gain_var[trans_idx].q * scaling;
+
     // Output I and Q as stereo data
     if(swap == false)	 			// if is it "RX LO LOW" mode, save I/Q data without swapping, putting it in "upper" sideband (above the LO)
     {
@@ -4213,13 +4025,14 @@ static void AudioDriver_TxIqProcessingFinal(float scaling, bool swap, AudioSampl
     }
     else	 	// it is "RX LO HIGH" - swap I/Q data while saving, putting it in the "lower" sideband (below the LO)
     {
-        // this is the IQ gain / amplitude adjustment
         final_i_buffer = adb.q_buffer;
         final_q_buffer = adb.i_buffer;
     }
+
     // this is the IQ gain / amplitude adjustment
     arm_scale_f32(final_i_buffer, final_i_gain, final_i_buffer, blockSize);
     arm_scale_f32(final_q_buffer, final_q_gain, final_q_buffer, blockSize);
+
     // this is the IQ phase adjustment
     AudioDriver_IQPhaseAdjust(ts.txrx_mode, final_i_buffer, final_q_buffer,blockSize);
     for(int i = 0; i < blockSize; i++)
@@ -4249,7 +4062,7 @@ static void AudioDriver_TxAudioBufferFill(AudioSample_t * const src, int16_t blo
 
     if(ts.tune)     // TUNE mode?  If so, generate tone so we can adjust TX IQ phase and gain
     {
-        softdds_runf(adb.a_buffer, adb.a_buffer,blockSize);     // load audio buffer with the tone - DDS produces quadrature channels, but we need only one
+        softdds_runIQ(adb.a_buffer, adb.a_buffer,blockSize);     // load audio buffer with the tone - DDS produces quadrature channels, but we need only one
     }
     else
     {
@@ -4297,29 +4110,57 @@ static void AudioDriver_TxAudioBufferFill(AudioSample_t * const src, int16_t blo
             }
         }
 
-        arm_scale_f32(adb.a_buffer, gain_calc, adb.a_buffer, blockSize);  // apply gain
+        if (gain_calc != 1.0)
+        {
+        	arm_scale_f32(adb.a_buffer, gain_calc, adb.a_buffer, blockSize);  // apply gain
+        }
 
         ads.peak_audio = AudioDriver_absmax(adb.a_buffer, blockSize);
     }
 }
 
+/**
+ * takes audio samples in adb.a_buffer and produces SSB in adb.i_buffer/adb.q_buffer
+ * audio samples should filtered before passed in here if necessary
+ */
+
+static void AudioDriver_TxProcessorModulatorSSB(AudioSample_t * const dst, const uint16_t blockSize, const uint8_t iq_freq_mode, const bool is_lsb)
+{
+    // This is a phase-added 0-90 degree Hilbert transformer that also does low-pass and high-pass filtering
+    // to the transmitted audio.  As noted above, it "clobbers" the low end, which is why we made up for it with the above filter.
+    // + 0 deg to I data
+    arm_fir_f32(&FIR_I_TX, adb.a_buffer, adb.i_buffer,blockSize);
+    // - 90 deg to Q data
+    arm_fir_f32(&FIR_Q_TX, adb.a_buffer, adb.q_buffer, blockSize);
+
+    if(iq_freq_mode)
+    {
+        // is transmit frequency conversion to be done?
+        // LSB && (-6kHz || -12kHz) --> true, else false
+        // USB && (+6kHz || +12kHz) --> true, else false
+        bool swap = is_lsb == true && (iq_freq_mode == FREQ_IQ_CONV_M6KHZ || iq_freq_mode == FREQ_IQ_CONV_M12KHZ);
+        swap = swap || ((is_lsb == false) && (iq_freq_mode == FREQ_IQ_CONV_P6KHZ || iq_freq_mode == FREQ_IQ_CONV_P12KHZ));
+
+        AudioDriver_FreqConversion(adb.i_buffer, adb.q_buffer, blockSize, swap);
+    }
+
+    // apply I/Q amplitude & phase adjustments
+    AudioDriver_TxIqProcessingFinal(SSB_GAIN_COMP, is_lsb, dst, blockSize);
+
+}
+
 /***
  * takes the I Q input buffers containing the I Q audio for a single AM sideband and returns the frequency translated IQ sideband
- * in the i/q buffers.
- * Used temporary buffers:
- *  directly: i,q
- *  indirectly: c,d,e,f -> see audio_rx_freq_conv
+ * in the i/q input buffers given as argument.
  */
-static void AudioDriver_TxProcessorAMSideband(float32_t* I_buffer, float32_t* Q_buffer,  const int16_t blockSize) {
+static void AudioDriver_TxProcessorAMSideband(float32_t* i_buffer, float32_t* q_buffer,  const int16_t blockSize) {
 
     // generate AM carrier by applying a "DC bias" to the audio
-    //
-    arm_offset_f32(I_buffer, AM_CARRIER_LEVEL, adb.i_buffer, blockSize);
-    arm_offset_f32(Q_buffer, (-1 * AM_CARRIER_LEVEL), adb.q_buffer, blockSize);
-    //
+    arm_offset_f32(i_buffer, AM_CARRIER_LEVEL, i_buffer, blockSize);
+    arm_offset_f32(q_buffer, (-1 * AM_CARRIER_LEVEL), q_buffer, blockSize);
+
     // check and apply correct translate mode
-    //
-    AudioDriver_FreqConversion(blockSize, (ts.iq_freq_mode == FREQ_IQ_CONV_P6KHZ || ts.iq_freq_mode == FREQ_IQ_CONV_P12KHZ));
+    AudioDriver_FreqConversion(i_buffer, q_buffer, blockSize, (ts.iq_freq_mode == FREQ_IQ_CONV_P6KHZ || ts.iq_freq_mode == FREQ_IQ_CONV_P12KHZ));
 }
 
 static inline void AudioDriver_TxFilterAudio(bool do_bandpass, bool do_bass_treble, float32_t* inBlock, float32_t* outBlock, const uint16_t blockSize)
@@ -4329,7 +4170,7 @@ static inline void AudioDriver_TxFilterAudio(bool do_bandpass, bool do_bass_treb
         arm_iir_lattice_f32(&IIR_TXFilter, inBlock, outBlock, blockSize);
     }
     if (do_bass_treble)
-    { //
+    {
         // biquad filter for bass & treble --> NOT enabled when using USB Audio (eg. for Digimodes)
         arm_biquad_cascade_df1_f32 (&IIR_TX_biquad, outBlock,outBlock, blockSize);
     }
@@ -4357,27 +4198,26 @@ static void AudioDriver_TxProcessorFM(AudioSample_t * const src, AudioSample_t *
 
     AudioDriver_TxAudioBufferFill(src,blockSize);
 
-    AudioDriver_TxFilterAudio(true,ts.tx_audio_source != TX_AUDIO_DIG,adb.a_buffer,adb.i_buffer, blockSize);
+    if (!ts.tune)
+    {
+        AudioDriver_TxFilterAudio(true,ts.tx_audio_source != TX_AUDIO_DIG,adb.a_buffer,adb.a_buffer, blockSize);
+    }
 
-    AudioDriver_TxCompressor(adb.i_buffer, blockSize, FM_ALC_GAIN_CORRECTION);  // Do the TX ALC and speech compression/processing
-    //
-    // Do differentiating high-pass filter to provide 6dB/octave pre-emphasis - which also removes any DC component!  Takes audio from "i" and puts it into "a".
-    //
+    AudioDriver_TxCompressor(adb.a_buffer, blockSize, FM_ALC_GAIN_CORRECTION);  // Do the TX ALC and speech compression/processing
+
+    // Do differentiating high-pass filter to provide 6dB/octave pre-emphasis - which also removes any DC component!  Takes audio from "a" and puts it into "a".
     for(int i = 0; i < blockSize; i++)
     {
-        //
-        //
-        a = adb.i_buffer[i];
-        //
+        a = adb.a_buffer[i];
+
         b = FM_TX_HPF_ALPHA * (hpf_prev_b + a - hpf_prev_a);    // do differentiation
         hpf_prev_a = a;     // save "[n-1] samples for next iteration
         hpf_prev_b = b;
-        //
+
         adb.a_buffer[i] = b;    // save differentiated data in audio buffer
     }
-    //
+
     // do tone generation using the NCO (a.k.a. DDS) method.  This is used for subaudible tone generation and, if necessary, summing the result in "a".
-    //
     if((ads.fm_subaudible_tone_word) && (!ads.fm_tone_burst_active))        // generate tone only if it is enabled (and not during a tone burst)
     {
         for(int i = 0; i < blockSize; i++)
@@ -4389,9 +4229,8 @@ static void AudioDriver_TxProcessorFM(AudioSample_t * const src, AudioSample_t *
             adb.a_buffer[i] += ((float32_t)(DDS_TABLE[fm_tone_idx]) * FM_TONE_AMPLITUDE_SCALING * fm_mod_mult); // load indexed sine wave value, adding it to audio
         }
     }
-    //
+
     // do tone  generation using the NCO (a.k.a. DDS) method.  This is used for tone burst ("whistle-up") generation, summing the result in "a".
-    //
     if(ads.fm_tone_burst_active)                // generate tone burst only if it is enabled
     {
         for(int i = 0; i < blockSize; i++)
@@ -4453,7 +4292,7 @@ static void AudioDriver_TxProcessorDigital (AudioSample_t * const src, AudioSamp
     // If source is digital usb in, pull from USB buffer, discard line or mic audio and
     // let the normal processing happen
 
-    if (ts.digital_mode==1)
+    if (ts.digital_mode == DigitalMode_FreeDV)
     { //we are in freedv-mode
 
         AudioDriver_TxAudioBufferFill(src,blockSize);
@@ -4605,16 +4444,28 @@ static void AudioDriver_TxProcessorDigital (AudioSample_t * const src, AudioSamp
 }
 #endif
 
+static void AudioDriver_TxProcessorRtty(AudioSample_t * const dst, uint16_t blockSize)
+{
 
-//*----------------------------------------------------------------------------
-//* Function Name       : audio_tx_processor
-//* Object              :
-//* Object              : audio sample processor
-//* Input Parameters    :
-//* Output Parameters   :
-//* Functions called    :
-//*----------------------------------------------------------------------------
-static void AudioDriver_TxProcessor(AudioSample_t * const srcCodec, AudioSample_t * const dst, uint16_t blockSize)
+	for (uint16_t idx =0; idx < blockSize; idx++)
+	{
+		adb.a_buffer[idx] = Rtty_Modulator_GenSample();
+	}
+    AudioDriver_TxFilterAudio(true,false, adb.a_buffer, adb.a_buffer, blockSize);
+    AudioDriver_TxProcessorModulatorSSB(dst, blockSize, ts.iq_freq_mode, ts.digi_lsb);
+
+    // remove noise if no CW is keyed
+    memset(adb.a_buffer,0,sizeof(adb.a_buffer[0])*blockSize);
+
+    if (ts.cw_keyer_mode != CW_KEYER_MODE_STRAIGHT)
+    {
+    	CwGen_Process(adb.a_buffer, adb.a_buffer, blockSize);
+    	// we just misuse adb.a_buffer, and generate a CW side tone
+    }
+
+}
+
+static void AudioDriver_TxProcessor(AudioSample_t * const srcCodec, AudioSample_t * const dst, AudioSample_t * const audioDst, uint16_t blockSize)
 {
     // we copy volatile variables which are used multiple times to local consts to let the compiler do its optimization magic
     // since we are in an interrupt, no one will change these anyway
@@ -4627,9 +4478,14 @@ static void AudioDriver_TxProcessor(AudioSample_t * const srcCodec, AudioSample_
     AudioSample_t * const src = (tx_audio_source == TX_AUDIO_DIG || tx_audio_source == TX_AUDIO_DIGIQ) ? srcUSB : srcCodec;
 
     // if we want to know if our signal will go out, look at this flag
-    bool external_tx_mute = ts.audio_dac_muting_flag || ts.audio_dac_muting_buffer_count >0 ;
+    bool external_tx_mute = ts.audio_dac_muting_flag || ts.audio_dac_muting_buffer_count > 0;
 
     bool signal_active = false; // unless this is set to true, zero output will be generated
+    bool cw_signal_active = false;
+    if (ts.cw_keyer_mode != CW_KEYER_MODE_STRAIGHT && ts.cw_text_entry) // FIXME to be simplified when straight mode reworked to call always when cw_text_entry is active
+    {
+    	cw_signal_active = CwGen_Process(adb.i_buffer, adb.q_buffer, blockSize);
+    }
 
     // If source is digital usb in, pull from USB buffer, discard line or mic audio and
     // let the normal processing happen
@@ -4652,150 +4508,146 @@ static void AudioDriver_TxProcessor(AudioSample_t * const srcCodec, AudioSample_
         AudioDriver_TxIqProcessingFinal(1.0, false, dst, blockSize);
         signal_active = true;
     }
-    else
-        if (ts.dvmode) {
+    else if (ts.dvmode == true)
+    {
+    	switch(ts.digital_mode)
+    	{
 #ifdef USE_FREEDV
+    	case DigitalMode_FreeDV:
+        {
             AudioDriver_TxProcessorDigital(src,dst,blockSize);
             signal_active = true;
+        }
+        break;
 #endif
-        }
-        else if(dmod_mode == DEMOD_CW)
+    	case DigitalMode_RTTY:
+    	{
+            AudioDriver_TxProcessorRtty(dst,blockSize);
+            signal_active = true;
+    	}
+    	break;
+    	}
+    }
+    else if(dmod_mode == DEMOD_CW || ts.cw_text_entry)
+    {
+        if (tune)
         {
-            if (tune)
+            softdds_runIQ(adb.i_buffer, adb.q_buffer, blockSize);      // generate tone/modulation for TUNE
+            // Equalize based on band and simultaneously apply I/Q gain & phase adjustments
+            signal_active = true;
+        }
+        else
+        {
+            // Generate CW tone if necessary
+            if (external_tx_mute == false)
             {
-                softdds_runf(adb.i_buffer, adb.q_buffer,blockSize);      // generate tone/modulation for TUNE
-                // Equalize based on band and simultaneously apply I/Q gain & phase adjustments
-                signal_active = true;
-            }
-            else
-            {
-                // Generate CW tone if necessary
-                if (external_tx_mute == false)
+                if (ts.cw_keyer_mode == CW_KEYER_MODE_STRAIGHT || !ts.cw_text_entry) // FIXME to delete straight mode check when straight mode reworked
                 {
-                    signal_active = CwGen_Process(adb.i_buffer, adb.q_buffer,blockSize);
-
+                	cw_signal_active = CwGen_Process(adb.i_buffer, adb.q_buffer, blockSize);
                 }
-            }
 
-            if (signal_active)
-            {
-
-                // apply I/Q amplitude & phase adjustments
-                // Wouldn't it be necessary to include IF conversion here? DD4WH June 16th, 2016
-                // Answer: NO, in CW that is done be changing the Si570 frequency during TX/RX switching . . .
-                AudioDriver_TxIqProcessingFinal(1.0, ts.cw_lsb == 0, dst, blockSize);
+                signal_active = cw_signal_active;
             }
         }
+
+        if (signal_active)
+        {
+            // apply I/Q amplitude & phase adjustments
+            // Wouldn't it be necessary to include IF conversion here? DD4WH June 16th, 2016
+            // Answer: NO, in CW that is done be changing the Si570 frequency during TX/RX switching . . .
+            AudioDriver_TxIqProcessingFinal(1.0, ts.cw_lsb == 0, dst, blockSize);
+        }
+    }
     // SSB processor
-        else if(is_ssb(dmod_mode))
+    else if(is_ssb(dmod_mode))
+    {
+        if (ads.tx_filter_adjusting == false)
         {
-            if (ads.tx_filter_adjusting == false)
+            AudioDriver_TxAudioBufferFill(src,blockSize);
+
+            if (!tune)
             {
-                AudioDriver_TxAudioBufferFill(src,blockSize);
-
-
-                if (!tune)
-                {
-                    AudioDriver_TxFilterAudio(true,tx_audio_source != TX_AUDIO_DIG, adb.a_buffer,adb.a_buffer, blockSize);
-                }
-
-
-                // Do the TX ALC and speech compression/processing
-                AudioDriver_TxCompressor(adb.a_buffer, blockSize, SSB_ALC_GAIN_CORRECTION);
-
-                // This is a phase-added 0-90 degree Hilbert transformer that also does low-pass and high-pass filtering
-                // to the transmitted audio.  As noted above, it "clobbers" the low end, which is why we made up for it with the above filter.
-                // + 0 deg to I data
-                arm_fir_f32(&FIR_I_TX,adb.a_buffer,adb.i_buffer,blockSize);
-                // - 90 deg to Q data
-                arm_fir_f32(&FIR_Q_TX,adb.a_buffer,adb.q_buffer, blockSize);
-
-
-                if(iq_freq_mode)
-                {
-                    // is transmit frequency conversion to be done?
-                    // LSB && (-6kHz || -12kHz) --> true, else false
-                    // USB && (+6kHz || +12kHz) --> true, else false
-                    bool swap = dmod_mode == DEMOD_LSB && (iq_freq_mode == FREQ_IQ_CONV_M6KHZ || iq_freq_mode == FREQ_IQ_CONV_M12KHZ);
-                    swap = swap || ((dmod_mode == DEMOD_USB) && (iq_freq_mode == FREQ_IQ_CONV_P6KHZ || iq_freq_mode == FREQ_IQ_CONV_P12KHZ));
-
-                    AudioDriver_FreqConversion(blockSize, swap);
-                }
-
-                // apply I/Q amplitude & phase adjustments
-                AudioDriver_TxIqProcessingFinal(SSB_GAIN_COMP, dmod_mode == DEMOD_LSB, dst, blockSize);
-                signal_active = true;
+                AudioDriver_TxFilterAudio(true,tx_audio_source != TX_AUDIO_DIG, adb.a_buffer, adb.a_buffer, blockSize);
             }
+
+            // Do the TX ALC and speech compression/processing
+            AudioDriver_TxCompressor(adb.a_buffer, blockSize, SSB_ALC_GAIN_CORRECTION);
+
+            AudioDriver_TxProcessorModulatorSSB(dst, blockSize, iq_freq_mode, dmod_mode == DEMOD_LSB);
+            signal_active = true;
         }
+    }
     // -----------------------------
     // AM handler - Generate USB and LSB AM signals and combine  [KA7OEI]
     //
-        else if(dmod_mode == DEMOD_AM)	 	//	Is it in AM mode *AND* is frequency translation active?
+    else if(dmod_mode == DEMOD_AM)	 	//	Is it in AM mode *AND* is frequency translation active?
+    {
+        if(iq_freq_mode && ads.tx_filter_adjusting == false)	 				// is translation active?
         {
-            if(iq_freq_mode && ads.tx_filter_adjusting == false)	 				// is translation active?
+            AudioDriver_TxAudioBufferFill(src,blockSize);
+            //
+            // Apply the TX equalization filtering:  This "flattens" the audio
+            // prior to being applied to the Hilbert transformer as well as added low-pass filtering.
+            // It does this by applying a "peak" to the bottom end to compensate for the roll-off caused by the Hilbert
+            // and then a gradual roll-off toward the high end.  The net result is a very flat (to better than 1dB) response
+            // over the 275-2500 Hz range.
+            //
+            if (!tune)
             {
-                AudioDriver_TxAudioBufferFill(src,blockSize);
-                //
-                // Apply the TX equalization filtering:  This "flattens" the audio
-                // prior to being applied to the Hilbert transformer as well as added low-pass filtering.
-                // It does this by applying a "peak" to the bottom end to compensate for the roll-off caused by the Hilbert
-                // and then a gradual roll-off toward the high end.  The net result is a very flat (to better than 1dB) response
-                // over the 275-2500 Hz range.
-                //
-
-                AudioDriver_TxFilterAudio((ts.flags1 & FLAGS1_AM_TX_FILTER_DISABLE) == false,tx_audio_source != TX_AUDIO_DIG, adb.a_buffer,adb.a_buffer , blockSize);
-                //
-                // This is a phase-added 0-90 degree Hilbert transformer that also does low-pass and high-pass filtering
-                // to the transmitted audio.  As noted above, it "clobbers" the low end, which is why we made up for it with the above filter.
-                // Apply transformation AND audio filtering to buffer data
-                //
-                // + 0 deg to I data
-                // AudioDriver_delay_f32((arm_fir_instance_f32 *)&FIR_I_TX,(float32_t *)(adb.a_buffer),(float32_t *)(adb.i_buffer),blockSize);
-
-                AudioDriver_TxCompressor(adb.a_buffer, blockSize, AM_ALC_GAIN_CORRECTION);    // Do the TX ALC and speech compression/processing
-
-                arm_fir_f32(&FIR_I_TX,adb.a_buffer,adb.i_buffer,blockSize);
-                // - 90 deg to Q data
-                arm_fir_f32(&FIR_Q_TX,adb.a_buffer,adb.q_buffer, blockSize);
-
-                //
-                // COMMENT:  It would be trivial to add the option of generating AM with just a single (Upper or Lower) sideband since we are generating the two, separately anyway
-                // and putting them back together!  [KA7OEI]
-                //
-                //
-                // First, generate the LOWER sideband of the AM signal
-                // copy contents to temporary holding buffers for later generation of USB AM carrier
-                //
-                arm_negate_f32(adb.i_buffer, adb.a_buffer, blockSize); // this becomes the q buffer for the upper  sideband
-                arm_negate_f32(adb.q_buffer, adb.b_buffer, blockSize); // this becomes the i buffer for the upper  sideband
-
-                // now generate USB AM sideband signal
-                AudioDriver_TxProcessorAMSideband(adb.i_buffer,adb.q_buffer,blockSize);
-
-                arm_copy_f32(adb.i_buffer, adb.i2_buffer, blockSize);
-                arm_copy_f32(adb.q_buffer, adb.q2_buffer, blockSize);
-                // i2/q2 now contain the LSB AM signal
-
-                // now generate USB AM sideband signal
-                AudioDriver_TxProcessorAMSideband(adb.b_buffer,adb.a_buffer,blockSize);
-
-                arm_add_f32(adb.i2_buffer,adb.i_buffer,adb.i_buffer,blockSize);
-                arm_add_f32(adb.q2_buffer,adb.q_buffer,adb.q_buffer,blockSize);
-
-                AudioDriver_TxIqProcessingFinal(AM_GAIN_COMP, false, dst, blockSize);
-                signal_active = true;
+                AudioDriver_TxFilterAudio((ts.flags1 & FLAGS1_AM_TX_FILTER_DISABLE) == false,tx_audio_source != TX_AUDIO_DIG, adb.a_buffer, adb.a_buffer, blockSize);
             }
+            //
+            // This is a phase-added 0-90 degree Hilbert transformer that also does low-pass and high-pass filtering
+            // to the transmitted audio.  As noted above, it "clobbers" the low end, which is why we made up for it with the above filter.
+            // Apply transformation AND audio filtering to buffer data
+            //
+            // + 0 deg to I data
+            // AudioDriver_delay_f32((arm_fir_instance_f32 *)&FIR_I_TX,(float32_t *)(adb.a_buffer),(float32_t *)(adb.i_buffer),blockSize);
+
+            AudioDriver_TxCompressor(adb.a_buffer, blockSize, AM_ALC_GAIN_CORRECTION);    // Do the TX ALC and speech compression/processing
+
+            arm_fir_f32(&FIR_I_TX, adb.a_buffer, adb.i_buffer, blockSize);
+            // - 90 deg to Q data
+            arm_fir_f32(&FIR_Q_TX, adb.a_buffer, adb.q_buffer, blockSize);
+
+            // COMMENT:  It would be trivial to add the option of generating AM with just a single (Upper or Lower) sideband since we are generating the two, separately anyway
+            // and putting them back together!  [KA7OEI]
+            //
+            //
+            // First, generate the LOWER sideband of the AM signal
+
+            // temporary buffers;
+            float32_t  i2_buffer[blockSize];
+            float32_t  q2_buffer[blockSize];
+
+
+            arm_negate_f32(adb.i_buffer, q2_buffer, blockSize); // this becomes the q buffer for the upper  sideband
+            arm_negate_f32(adb.q_buffer, i2_buffer, blockSize); // this becomes the i buffer for the upper  sideband
+
+            // now generate USB AM sideband signal
+            AudioDriver_TxProcessorAMSideband(adb.i_buffer, adb.q_buffer, blockSize);
+            // i/q now contain the LSB AM signal
+
+            // now generate USB AM sideband signal
+            AudioDriver_TxProcessorAMSideband(i2_buffer, q2_buffer, blockSize);
+
+            arm_add_f32(i2_buffer, adb.i_buffer, adb.i_buffer,blockSize);
+            arm_add_f32(q2_buffer, adb.q_buffer, adb.q_buffer,blockSize);
+
+            AudioDriver_TxIqProcessingFinal(AM_GAIN_COMP, false, dst, blockSize);
+            signal_active = true;
         }
-        else if(dmod_mode == DEMOD_FM)	 	//	Is it in FM mode
+    }
+    else if(dmod_mode == DEMOD_FM)	 	//	Is it in FM mode
+    {
+        //  *AND* is frequency translation active (No FM possible unless in frequency translate mode!)
+        if (iq_freq_mode)
         {
-            //  *AND* is frequency translation active (No FM possible unless in frequency translate mode!)
-            if (iq_freq_mode)
-            {
-                // FM handler  [KA7OEI October, 2015]
-                AudioDriver_TxProcessorFM(src,dst,blockSize);
-                signal_active = true;
-            }
+            // FM handler  [KA7OEI October, 2015]
+            AudioDriver_TxProcessorFM(src,dst,blockSize);
+            signal_active = true;
         }
+    }
 
     if (signal_active == false  || external_tx_mute )
     {
@@ -4806,6 +4658,29 @@ static void AudioDriver_TxProcessor(AudioSample_t * const srcCodec, AudioSample_
             ts.audio_dac_muting_buffer_count--;
         }
     }
+
+#ifdef UI_BRD_OVI40
+    // we code the sidetone to the audio codec, since we have one for audio and one for iq
+    if (audioDst != dst)
+    {
+    	if (dmod_mode == DEMOD_CW)
+    	{
+    		for (uint16_t idx = 0; idx < blockSize; idx++)
+    		{
+    			audioDst[idx].r = audioDst[idx].l = dst[idx].l;
+    		}
+    	} else if (is_demod_rtty())
+    	{
+    		for (uint16_t idx = 0; idx < blockSize; idx++)
+    		{
+    			// we simulate the effect of the SSB tx iq processing to get a similar audio volume
+    			// as the CW sidetone
+    			audioDst[idx].r = audioDst[idx].l = adb.a_buffer[idx] * ts.tx_power_factor;
+    		}
+    	}
+    }
+#endif
+
     switch (ts.stream_tx_audio)
     {
     case STREAM_TX_AUDIO_OFF:
@@ -4852,7 +4727,7 @@ static void AudioDriver_TxProcessor(AudioSample_t * const srcCodec, AudioSample_
 #ifdef USE_24_BITS
 void AudioDriver_I2SCallback(int32_t *src, int32_t *dst, int16_t size, uint16_t ht)
 #else
-void AudioDriver_I2SCallback(int16_t *src, int16_t *dst, int16_t size, uint16_t ht)
+void AudioDriver_I2SCallback(int16_t *src, int16_t *dst, int16_t* audioDst, int16_t size)
 #endif
 {
     static bool to_rx = false;	// used as a flag to clear the RX buffer
@@ -4860,9 +4735,9 @@ void AudioDriver_I2SCallback(int16_t *src, int16_t *dst, int16_t size, uint16_t 
     static ulong tcount = 0;
     bool muted = false;
 
-    if(ts.show_tp_coordinates)
+    if(ts.show_debug_info)
     {
-        MchfBoard_GreenLed(LED_STATE_ON);
+        Board_GreenLed(LED_STATE_ON);
     }
 
     if((ts.txrx_mode == TRX_MODE_RX))
@@ -4894,6 +4769,10 @@ void AudioDriver_I2SCallback(int16_t *src, int16_t *dst, int16_t size, uint16_t 
         else
         {
             AudioDriver_RxProcessor((AudioSample_t*) src, (AudioSample_t*)dst,size/2);
+            if (ts.cw_keyer_mode != CW_KEYER_MODE_STRAIGHT && (ts.cw_text_entry || ts.dmod_mode == DEMOD_CW)) // FIXME to call always when straight mode reworked
+            {
+            	CwGen_Process(adb.i_buffer, adb.q_buffer, size/2);
+            }
         }
 
         to_tx = true;		// Set flag to indicate that we WERE receiving when we go back to transmit mode
@@ -4919,12 +4798,12 @@ void AudioDriver_I2SCallback(int16_t *src, int16_t *dst, int16_t size, uint16_t 
         {
             // muted input should not modify the ALC so we simply restore it after processing
             float alc_holder = ads.alc_val;
-            AudioDriver_TxProcessor((AudioSample_t*) src, (AudioSample_t*)dst,size/2);
+            AudioDriver_TxProcessor((AudioSample_t*) src, (AudioSample_t*)dst, (AudioSample_t*)audioDst,size/2);
             ads.alc_val = alc_holder;
         }
         else
         {
-            AudioDriver_TxProcessor((AudioSample_t*) src, (AudioSample_t*)dst,size/2);
+            AudioDriver_TxProcessor((AudioSample_t*) src, (AudioSample_t*)dst, (AudioSample_t*)audioDst, size/2);
         }
 
         to_rx = true;		// Set flag to indicate that we WERE transmitting when we eventually go back to receive mode
@@ -4963,8 +4842,8 @@ void AudioDriver_I2SCallback(int16_t *src, int16_t *dst, int16_t size, uint16_t 
         ts.spectrum_scheduler--;
     }
 
-    if(ts.show_tp_coordinates)
+    if(ts.show_debug_info)
     {
-        MchfBoard_GreenLed(LED_STATE_OFF);
+        Board_GreenLed(LED_STATE_OFF);
     }
 }

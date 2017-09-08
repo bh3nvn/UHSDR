@@ -28,7 +28,7 @@
 // for each Si570, but the values below appear to approximately follow typical AT-cut
 // temperature-frequency curves.
 //
-#include "mchf_board.h"
+#include "uhsdr_board.h"
 #include "soft_tcxo.h"
 #include "ui_si570.h"
 #include "radio_management.h"
@@ -147,9 +147,6 @@ void SoftTcxo_Init()
 
     // Temp sensor setup
     lo.sensor_present = Si570_InitExternalTempSensor() == 0;
-
-    // Read SI570 settings
-    Si570_ResetConfiguration();
 }
 
 

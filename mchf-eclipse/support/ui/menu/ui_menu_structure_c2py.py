@@ -2,7 +2,7 @@
 
 """
 
-2016-12-30 HB9ocq - extract mcHF LCD-menu definition data from C-cource
+2016-12-30 HB9ocq - extract uhsdr LCD-menu definition data from C-cource
                     and transform to Python, showing on stdout
 
 WARNING: THIS BASES HEAVILY UPON (UN-)DISCIPLINE IN C SYNTAX ! ! !
@@ -25,12 +25,12 @@ import subprocess
 
 # this points from HERE to the 'mchf-eclipse' directory of our project
 MCHF_BASEDIR = r"../../../"
-MCHF_VERSIONFILE = MCHF_BASEDIR + r'src/mchf_version.h'
+MCHF_VERSIONFILE = MCHF_BASEDIR + r'src/uhsdr_version.h'
 
 # the ONLY C-source we do read AND understand
 INPUT_C_SRC = MCHF_BASEDIR + r"drivers/ui/menu/ui_menu_structure.c"
 
-# reading version from mchf_version.h
+# reading version from uhsdr_version.h
 MAJ = subprocess.check_output('cat ' + MCHF_VERSIONFILE + ' | cut -d " " -f 2 | grep "TRX4M" | egrep -e "^[^#]" | grep "MAJOR" | cut -d "\\"" -f 2 | tr -d $"\n"', shell = True)
 MIN = subprocess.check_output('cat ' + MCHF_VERSIONFILE + ' | cut -d " " -f 2 | grep "TRX4M" | egrep -e "^[^#]" | grep "MINOR" | cut -d "\\"" -f 2 | tr -d $"\n"', shell = True)
 REL = subprocess.check_output('cat ' + MCHF_VERSIONFILE + ' | cut -d " " -f 2 | grep "TRX4M" | egrep -e "^[^#]" | grep "RELEASE" | cut -d "\\"" -f 2 | tr -d $"\n"', shell = True)
@@ -80,7 +80,8 @@ MENULN_REO = re.compile(  # pattern for lines..
     + r'[,\s]+'
     + r'(?P<NR>[\w]+)'                       # ..a 3rd rather long id 'yy...zz', we call it NR
     + r'[,\s]+'
-    + r'NULL'                                # ..an initial value for a pointer: not relevant for handbook
+	+ r'.*[^,]'								 # ..show conditional entries, too
+#    + r'NULL'                               # .. this would show only non-conditional entries
     + r'[,\s]+'
     + r'"(?P<LABEL>[^"]*)"'                  # ..n chars in quotes, we call this LABEL
     + r'[,\s]+'

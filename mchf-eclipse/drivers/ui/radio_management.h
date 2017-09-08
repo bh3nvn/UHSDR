@@ -8,7 +8,7 @@
 #ifndef DRIVERS_UI_RADIO_MANAGEMENT_H_
 #define DRIVERS_UI_RADIO_MANAGEMENT_H_
 
-#include "mchf_board.h"
+#include "uhsdr_board.h"
 // Frequency public structure
 typedef struct DialFrequency
 {
@@ -154,6 +154,30 @@ typedef enum {
     CW_OFFSET_SHIFT
 } cw_dial_t;
 
+typedef enum
+{
+    DigitalMode_None = 0,
+    DigitalMode_FreeDV,
+    DigitalMode_RTTY,
+    DigitalMode_FreeDV2,
+    DigitalMode_BPSK31,
+    DigitalMode_SSTV,
+    DigitalMode_WSPR_A,
+    DigitalMode_WSPR_P,
+    DigitalMode_Num_Modes
+} digital_modes_t;
+
+typedef struct
+{
+    const char* label;
+    const uint32_t enabled;
+} digital_mode_desc_t;
+
+// The following descriptor table has to be in the order of the enum digital_modes_t in  radio_management.h
+// This table is stored in flash (due to const) and cannot be written to
+// for operational data per mode [r/w], use a different table with order of modes
+extern const digital_mode_desc_t digimodes[DigitalMode_Num_Modes];
+
 
 typedef struct
 {
@@ -181,12 +205,15 @@ uint8_t RadioManagement_GetBand(ulong freq);
 bool RadioManagement_PowerLevelChange(uint8_t band, uint8_t power_level);
 bool RadioManagement_Tune(bool tune);
 bool RadioManagement_UpdatePowerAndVSWR();
-void    RadioManagement_SetHWFiltersForFrequency(ulong freq);
+void RadioManagement_SetHWFiltersForFrequency(ulong freq);
 void RadioManagement_ChangeCodec(uint32_t codec, bool enableCodec);
 bool RadioManagement_ChangeFrequency(bool force_update, uint32_t dial_freq,uint8_t txrx_mode);
 void RadioManagement_HandlePttOnOff();
 void RadioManagement_MuteTemporarilyRxAudio();
-uint32_t RadioManagement_NextDemodMode(uint32_t loc_mode, bool alternate_mode);
+
+uint32_t RadioManagement_NextNormalDemodMode(uint32_t loc_mode);
+uint32_t RadioManagement_NextAlternativeDemodMode(uint32_t loc_mode);
+
 Si570_ResultCodes RadioManagement_ValidateFrequencyForTX(uint32_t dial_freq);
 bool RadioManagement_IsApplicableDemodMode(uint32_t demod_mode);
 void RadioManagement_SwitchTxRx(uint8_t txrx_mode, bool tune_mode);
@@ -196,7 +223,7 @@ bool RadioManagement_USBActive(uint16_t dmod_mode);
 void RadioManagement_SetBandPowerFactor(uchar band);
 void RadioManagement_SetPaBias();
 bool RadioManagement_CalculateCWSidebandMode(void);
-void RadioManagement_SetDemodMode(uint32_t new_mode);
+void RadioManagement_SetDemodMode(uint8_t new_mode);
 void RadioManagement_HandleRxIQSignalCodecGain();
 const cw_mode_map_entry_t* RadioManagement_CWConfigValueToModeEntry(uint8_t cw_offset_mode);
 uint8_t RadioManagement_CWModeEntryToConfigValue(const cw_mode_map_entry_t* mode_entry);
@@ -207,11 +234,20 @@ void RadioManagement_ToggleVfoAB();
 bool RadioManagement_FmDevIs5khz();
 void RadioManagement_FmDevSet5khz(bool is5khz);
 
+uint32_t RadioManagement_GetTXDialFrequency();
+uint32_t RadioManagement_GetRXDialFrequency();
+int32_t  RadioManagement_GetCWDialOffset();
+
+
 inline void RadioManagement_ToggleVfoMem()
 {
     ts.vfo_mem_flag = ! ts.vfo_mem_flag;
 }
 
+inline bool is_demod_rtty()
+{
+	return ts.dmod_mode == DEMOD_DIGI && ts.digital_mode == DigitalMode_RTTY;
+}
 
 
 #endif /* DRIVERS_UI_RADIO_MANAGEMENT_H_ */

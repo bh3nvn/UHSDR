@@ -18,7 +18,7 @@
 
 #include "arm_math.h"
 #include "softdds.h"
-#include "mchf_hw_i2s.h"
+#include "uhsdr_hw_i2s.h"
 
 // 16 or 24 bits from Codec
 // 24 bits are not supported anywhere in the recent code!
@@ -70,23 +70,11 @@ typedef struct
     // Stereo buffers
     float32_t                   i_buffer[IQ_BUFSZ];
     float32_t                   q_buffer[IQ_BUFSZ];
+
     float32_t                   a_buffer[IQ_BUFSZ];
+    float32_t                   b_buffer[IQ_BUFSZ];
 
-    float32_t                   b_buffer[(IQ_BUFSZ*2)];   // this is larger since we need interleaved data for magnitude calculation in AM demod and thus, twice as much space
-
-    float32_t                   c_buffer[IQ_BUFSZ]; // only used in two places ( audio_rx_freq_conv and audio_demod_fm )
-    float32_t                   d_buffer[IQ_BUFSZ]; // only used in two places ( audio_rx_freq_conv and audio_demod_fm )
-    float32_t                   e_buffer[IQ_BUFSZ]; // only used in three places audio_rx_freq_conv / rx_proc / tx_proc
-    float32_t                   f_buffer[IQ_BUFSZ]; // only used in three places audio_rx_freq_conv / rx_proc / tx_proc
-
-    float32_t                   i2_buffer[IQ_BUFSZ];
-    float32_t                   q2_buffer[IQ_BUFSZ];
-
-    //
-    float32_t                   Osc_I_buffer[IQ_BUFSZ];
-    float32_t                   Osc_Q_buffer[IQ_BUFSZ];
-
-    float32_t                   agc_valbuf[BUFF_LEN];   // holder for "running" AGC value
+    float32_t               agc_valbuf[BUFF_LEN];   // holder for "running" AGC value
     float32_t               DF;
     float32_t               pll_fmax;
     // DX adjustments: zeta = 0.15, omegaN = 100.0
@@ -125,18 +113,7 @@ typedef struct
     float32_t               teta3_old;
     float32_t               M_c1;
     float32_t               M_c2;
- //   float32_t               NR_FFT_buffer[2048];
- //   float32_t               NR_iFFT_buffer[2048];
-
 } AudioDriverBuffer;
-
-typedef struct {
-    float                   a;
-    float                   b;
-    float                   sin;
-    float                   cos;
-    float                   r;
-} Goertzel;
 
 // Audio driver publics
 typedef struct AudioDriverState
@@ -144,8 +121,8 @@ typedef struct AudioDriverState
     //
     // Lock audio filter flag
     //
-    bool					af_disabled;			// if TRUE, audio filtering is disabled (used during filter bandwidth changing, etc.)
-    bool					tx_filter_adjusting;	// used to disable TX I/Q filter during phase adjustment
+    volatile bool					af_disabled;			// if TRUE, audio filtering is disabled (used during filter bandwidth changing, etc.)
+    volatile bool					tx_filter_adjusting;	// used to disable TX I/Q filter during phase adjustment
 
     // AGC and audio related variables
 
@@ -190,7 +167,7 @@ typedef struct AudioDriverState
     float					fm_subaudible_tone_det_freq;	// frequency, in Hz, of currently-selected subaudible tone for detection
     bool					fm_subaudible_tone_detected;	// TRUE if subaudible tone has been detected
     //
-    SoftDds					beep;				// this is the actively-used DDS tone word for the radio's beep generator
+    soft_dds_t					beep;				// this is the actively-used DDS tone word for the radio's beep generator
     float					beep_loudness_factor;	// this is used to set the beep loudness
     int                     carrier_freq_offset;
     int                     pll_fmax_int;
@@ -579,17 +556,20 @@ int32_t AudioDriver_GetTranslateFreq();
 void AudioDriver_SetSamPllParameters (void);
 void AudioDriver_SetupAGC(void);
 float log10f_fast(float X);
+
+void RttyDecoder_Init();
+
 //float log10f_fast
 //uchar audio_check_nr_dsp_state(void);
 
 #ifdef USE_24_BITS
 void AudioDriver_I2SCallback(int32_t *src, int32_t *dst, int16_t size, uint16_t ht);
 #else
-void AudioDriver_I2SCallback(int16_t *src, int16_t *dst, int16_t size, uint16_t ht);
+void AudioDriver_I2SCallback(int16_t *src, int16_t *dst, int16_t *audioDst, int16_t size);
 #endif
 
 // Public Audio
-extern __IO AudioDriverState	ads;
+extern AudioDriverState	ads;
 extern __IO SMeter              sm;
 
 // change this to 2048 (=1024 tap FFT), if problems with spectrum display with 7k5 SAM mode persist!

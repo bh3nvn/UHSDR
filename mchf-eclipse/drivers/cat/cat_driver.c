@@ -13,7 +13,7 @@
  ************************************************************************************/
 
 // Common
-#include "mchf_board.h"
+#include "uhsdr_board.h"
 #include "cat_driver.h"
 #include "usb_device.h"
 #include "usbd_cdc_if.h"
@@ -40,6 +40,24 @@ typedef struct CatDriver
 CatDriver                  cat_driver;
 
 
+static void CatDriver_CatEnableTX(bool enable)
+{
+    if (enable)
+    {
+        if(RadioManagement_IsTxDisabled() == false)
+        {
+            ts.ptt_req = true;
+            cat_driver.cat_ptt_active = true;
+        }
+    }
+    else
+    {
+        ts.ptt_req = false;
+        cat_driver.cat_ptt_active = false;
+    }
+}
+
+
 /**
  * @brief returns true if the current TX state has been initiated by a CAT PTT command
  */
@@ -47,17 +65,26 @@ bool CatDriver_CatPttActive()
 {
     return cat_driver.cat_ptt_active;
 }
+
 bool CatDriver_CWKeyPressed()
 {
     return cdcvcp_ctrllines.dtr != 0;
 }
 
-void CatDriver_InitInterface(void)
+bool CatDriver_PTTKeyPressed()
 {
+    return ts.enable_ptt_rts? (cdcvcp_ctrllines.rts != 0) : false;
 }
 
-void CatDriver_StopInterface(void)
+bool CatDriver_PTTKeyChangedState()
 {
+    static bool ptt_key_last_state;
+
+    bool curval = CatDriver_PTTKeyPressed();
+    bool retval = ptt_key_last_state != curval;
+    ptt_key_last_state = curval;
+
+    return retval;
 }
 
 
@@ -432,7 +459,7 @@ struct FT817
 };
 
 #include "ui_driver.h"
-#include "mchf_board.h"
+#include "uhsdr_board.h"
 
 // FT817 Emulation
 #if 0
@@ -524,7 +551,7 @@ bool CatDriver_Ft817_EEPROM_RW_Func(bool readEEPROM, uint16_t addr, uint8_t* dat
             )
             {
                 // we have to switch active vfo
-                UiDriver_ToggleVfoAB();
+                UiAction_ToggleVfoAB();
                 retval = true;
             }
             break;
@@ -1078,8 +1105,8 @@ static void CatDriver_HandleCommands()
             resp[0] = 0; // ACK
             bc = 1;
 
-            uint32_t new_mode = ts.dmod_mode;
-            uint32_t new_cwlsb = ts.cw_lsb;
+            uint8_t new_mode = ts.dmod_mode;
+            bool new_cwlsb = ts.cw_lsb;
             uint32_t new_fmdev5khz = RadioManagement_FmDevIs5khz();
             switch (ft817.req[0])
             {
@@ -1134,11 +1161,7 @@ static void CatDriver_HandleCommands()
             resp[0] = cat_driver.cat_ptt_active?0xF0:0x00;
             /* 0xF0 if PTT was already on */
 
-            if(RadioManagement_IsTxDisabled() == false)
-            {
-                ts.ptt_req = true;
-                cat_driver.cat_ptt_active = true;
-            }
+            CatDriver_CatEnableTX(true);
 
             bc = 1;
             break;
@@ -1147,7 +1170,7 @@ static void CatDriver_HandleCommands()
             bc = 1;
             break;
         case FT817_TOGGLE_VFO:
-            UiDriver_ToggleVfoAB();
+            UiAction_ToggleVfoAB();
             resp[0] = 0;
             bc = 1;
             break;
@@ -1163,9 +1186,8 @@ static void CatDriver_HandleCommands()
             break;
         case FT817_PTT_OFF:
             resp[0] = cat_driver.cat_ptt_active?0x00:0xF0; /* 0xF0 if PTT was already off */
-            ts.ptt_req = false;
-            cat_driver.cat_ptt_active = false;
             bc = 1;
+            CatDriver_CatEnableTX(false);
             break;
         case FT817_A7: /* A7 */
             resp[0]=0xA7;
@@ -1284,4 +1306,26 @@ void CatDriver_HandleProtocol()
             break;
         }
     }
+
+#if 1
+    // TODO: factor out
+    // handle emulated serial PTT Pin Handling
+    if (CatDriver_PTTKeyChangedState())
+    {
+        if (CatDriver_PTTKeyPressed())
+        {
+            if (CatDriver_CatPttActive() == false)
+            {
+                CatDriver_CatEnableTX(true);
+            }
+        }
+        else
+        {
+            if (CatDriver_CatPttActive() == true)
+            {
+                CatDriver_CatEnableTX(false);
+            }
+        }
+    }
+#endif
 }

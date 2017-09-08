@@ -13,12 +13,13 @@
 ************************************************************************************/
 
 // Common
-#include "mchf_board.h"
+#include "uhsdr_board.h"
 #include "audio_driver.h"
+#include "radio_management.h"
 
 #include <stdio.h>
 
-#include "mchf_hw_i2c.h"
+#include "uhsdr_hw_i2c.h"
 #include "codec.h"
 
 // I2C addresses
@@ -73,6 +74,7 @@
 #define W8731_POWER_DOWN_CNTR_MICPD     (0x02)
 #define W8731_POWER_DOWN_CNTR_LINEPD    (0x01)
 
+#define W8731_VOL_MAX 0x50
 
 #define W8731_POWER_DOWN_CNTR_MCHF_ALL_ON    (W8731_POWER_DOWN_CNTR_CLKOUTPD|W8731_POWER_DOWN_CNTR_OSCPD)
 // all on but osc and out, since we don't need it, clock comes from STM
@@ -90,12 +92,12 @@ __IO mchf_codec_t mchf_codecs[DMA_AUDIO_NUM];
 #ifdef UI_BRD_OVI40
 /**
  * @brief controls volume on "external" PA via DAC
- * @param vol volume in range of 0 to 80, where 80 is max volume
+ * @param vol volume in range of 0 to CODEC_SPEAKER_MAX_VOLUME
  */
 static void AudioPA_Volume(uint8_t vol)
 {
-    uint32_t lv = vol>0x50?0x50:vol;
-    HAL_DAC_SetValue(&hdac,DAC_CHANNEL_1,DAC_ALIGN_12B_R, (lv * 4095)/0x50);
+    uint32_t lv = vol>CODEC_SPEAKER_MAX_VOLUME?CODEC_SPEAKER_MAX_VOLUME:vol;
+    HAL_DAC_SetValue(&hdac,DAC_CHANNEL_1,DAC_ALIGN_12B_R, (lv * 4095)/CODEC_SPEAKER_MAX_VOLUME);
 }
 /**
  * @brief controls sound delivery on "external" PA via DAC
@@ -206,7 +208,7 @@ uint32_t Codec_Reset(uint32_t AudioFreq,uint32_t word_size)
 {
 
     uint32_t retval;
-#ifdef STM32F4
+#ifdef UI_BRD_MCHF
     retval = Codec_ResetCodec(CODEC_I2C, AudioFreq,word_size);
 #else
     retval = Codec_ResetCodec(CODEC_ANA_I2C, AudioFreq,word_size);
@@ -239,7 +241,7 @@ void Codec_RestartI2S()
 {
     // Reg 09: Active Control
     Codec_WriteRegister(CODEC_IQ_I2C, W8731_ACTIVE_CNTR,0x0000);
-    non_os_delay();
+    non_os_delay(); // we can't use HAL_Delay here, since our audio interrupt has higher priority which stops the ticks.
     // Reg 09: Active Control
     Codec_WriteRegister(CODEC_IQ_I2C, W8731_ACTIVE_CNTR,0x0001);
 }
@@ -256,7 +258,7 @@ void Codec_SwitchMicTxRxMode(uint8_t txrx_mode)
         // Set up microphone gain and adjust mic boost accordingly
         // Reg 04: Analog Audio Path Control (DAC sel, ADC Mic, Mic on)
 
-        non_os_delay();
+        // non_os_delay();
 
         if(ts.tx_gain[TX_AUDIO_MIC] > 50)	 		// actively adjust microphone gain and microphone boost
         {
@@ -278,40 +280,48 @@ void Codec_SwitchMicTxRxMode(uint8_t txrx_mode)
     }
 }
 
+static bool is_microphone_active()
+{
+	return ts.tx_audio_source == TX_AUDIO_MIC && (ts.dmod_mode != DEMOD_CW && is_demod_rtty() == false);
+}
+
 /**
  * @brief sets certain settings in preparation for smooth TX switching, call before actual switch function is called
  * @param current_txrx_mode the current mode, not the future mode (this is assumed to be TRX_MODE_TX)
  */
 void Codec_PrepareTx(uint8_t current_txrx_mode)
 {
-    // if(ts.dmod_mode != DEMOD_CW)                    // are we in a voice mode?
-    // FIXME: Remove commented out "if" above, if the CW guys accept that this works as wanted.
-    // Turns out that this code below adds about 60!ms of delay. CW guys don't like that.
-    {
-        Codec_LineInGainAdj(0); // yes - momentarily mute LINE IN audio if in LINE IN mode until we have switched to TX
+	Codec_LineInGainAdj(0); // yes - momentarily mute LINE IN audio if in LINE IN mode until we have switched to TX
 
-        if(ts.tx_audio_source == TX_AUDIO_MIC)  // we are in MIC IN mode
-        {
-            ts.tx_mic_gain_mult = 0;        // momentarily set the mic gain to zero while we go to TX
-            Codec_WriteRegister(CODEC_ANA_I2C, W8731_ANLG_AU_PATH_CNTR,W8731_ANLG_AU_PATH_CNTR_DACSEL|W8731_ANLG_AU_PATH_CNTR_INSEL_LINE|W8731_ANLG_AU_PATH_CNTR_MUTEMIC);
-            // Mute the microphone with the CODEC (this does so without a CLICK) and  remain/switch line in on
-            Codec_WriteRegister(CODEC_ANA_I2C, W8731_POWER_DOWN_CNTR,W8731_POWER_DOWN_CNTR_MCHF_ALL_ON);
-            // now we power on all amps including the mic preamp and bias
-        }
+	bool uses_mic_input = is_microphone_active();
 
-        // Is translate mode active and we have NOT already muted the audio output?
-        if((ts.iq_freq_mode) && (current_txrx_mode == TRX_MODE_RX))
-        {
-            Codec_VolumeSpkr(0);
-            Codec_VolumeLineOut(TRX_MODE_TX);    // yes - mute the audio codec to suppress an approx. 6 kHz chirp when going in to TX mode
-        }
+	if (uses_mic_input)  // we are in MIC IN mode
+	{
+		ts.tx_mic_gain_mult = 0; // momentarily set the mic gain to zero while we go to TX
+		Codec_WriteRegister(CODEC_ANA_I2C, W8731_ANLG_AU_PATH_CNTR,
+				W8731_ANLG_AU_PATH_CNTR_DACSEL
+						| W8731_ANLG_AU_PATH_CNTR_INSEL_LINE
+						| W8731_ANLG_AU_PATH_CNTR_MUTEMIC);
+		// Mute the microphone with the CODEC (this does so without a CLICK) and  remain/switch line in on
+		Codec_WriteRegister(CODEC_ANA_I2C, W8731_POWER_DOWN_CNTR,
+				W8731_POWER_DOWN_CNTR_MCHF_ALL_ON);
+		// now we power on all amps including the mic preamp and bias
+	}
 
-        // FIXME: Validate if we can remove this nasty delay or at least reduce it, 40ms are very long indeed.
-        if(ts.dmod_mode != DEMOD_CW)
-        {
-            non_os_delay();     // pause an instant because the codec chip has its own delay before tasks complete!
-        }
-    }
+	// Is translate mode active and we have NOT already muted the audio output?
+	if ((ts.iq_freq_mode) && (current_txrx_mode == TRX_MODE_RX))
+	{
+		Codec_VolumeSpkr(0);
+		Codec_VolumeLineOut(TRX_MODE_TX); // yes - mute the audio codec to suppress an approx. 6 kHz chirp when going in to TX mode
+	}
+
+
+	if (uses_mic_input)
+	{
+		HAL_Delay(10);
+		// pause an instant because the codec chip has its own delay before tasks complete when we use the microphone input!
+		// otherwise audible noise will be transmitted
+	}
 }
 
 
@@ -346,7 +356,7 @@ void Codec_SwitchTxRxMode(uint8_t txrx_mode)
     }
     else		// It is transmit
     {
-        if((ts.dmod_mode == DEMOD_CW) || (ts.tune && !ts.iq_freq_mode))
+        if(ts.dmod_mode == DEMOD_CW || is_demod_rtty() || (ts.tune && !ts.iq_freq_mode))
         // Turn sidetone on for CW or TUNE mode without freq translation
         {
             Codec_TxSidetoneSetgain(txrx_mode);	// set sidetone level
@@ -360,7 +370,6 @@ void Codec_SwitchTxRxMode(uint8_t txrx_mode)
 
             if(ts.tx_audio_source == TX_AUDIO_MIC)
             {
-
                 // now enabled the analog path according to gain settings
                 // with or without boost
                 Codec_SwitchMicTxRxMode(txrx_mode);
@@ -414,7 +423,7 @@ void Codec_TxSidetoneSetgain(uint8_t txrx_mode)
                 vcalc = 0;
             }
         }
-        Codec_VolumeSpkr(vcalc);
+        Codec_VolumeSpkr(vcalc/5); // divide by 5 to convert decibel to volume control steps
         Codec_VolumeLineOut(txrx_mode);		// set the calculated sidetone volume
     }
 }
@@ -422,23 +431,20 @@ void Codec_TxSidetoneSetgain(uint8_t txrx_mode)
 
 /**
  * @brief audio volume control in TX and RX modes for speaker [left headphone]
- * @param vol speaker / headphone volume in range  [0 - 80], unit is dB, 0 represents muting
+ * @param vol speaker / headphone volume in range  [0 - CODEC_SPEAKER_MAX_VOLUME], unit is dB, 0 represents muting
  */
 
 void Codec_VolumeSpkr(uint8_t vol)
 {
-    uint32_t lv = vol>0x50?0x50:vol;
+#ifdef UI_BRD_MCHF
+    uint32_t lv = vol*5>W8731_VOL_MAX?W8731_VOL_MAX:vol*5;
     // limit max value to 80
 
     lv += 0x2F; // volume offset, all lower values including 0x2F represent muting
     // Reg 02: Speaker - variable volume, change at zero crossing in order to prevent audible clicks
-//    Codec_WriteRegister(W8731_LEFT_HEADPH_OUT,lv); // (lv | W8731_HEADPH_OUT_ZCEN));
-#ifdef STM32F4
+    //    Codec_WriteRegister(W8731_LEFT_HEADPH_OUT,lv); // (lv | W8731_HEADPH_OUT_ZCEN));
     Codec_WriteRegister(CODEC_ANA_I2C, W8731_LEFT_HEADPH_OUT,(lv | W8731_HEADPH_OUT_ZCEN));
 #else
-    // both outputs are used for lineout/headphones
-    Codec_WriteRegister(CODEC_ANA_I2C, W8731_LEFT_HEADPH_OUT,(lv | W8731_HEADPH_OUT_ZCEN | W8731_HEADPH_OUT_HPBOTH));
-
     // external PA Control
     AudioPA_Volume(vol);
 #endif
@@ -454,9 +460,9 @@ void Codec_VolumeSpkr(uint8_t vol)
 void Codec_VolumeLineOut(uint8_t txrx_mode)
 {
 
-#ifdef STM32F4
-    // we do not have a special lineout yet on the STM32F7: lineout/headphones share a port.
-    // And since we have a dedidacted IQ codec, there is no need to switch of the lineout or headphones here
+    uint16_t lov =  ts.lineout_gain + 0x2F;
+
+#ifdef UI_BRD_MCHF
     // FIXME: F7PORT -> CW Sidetone needs to be "generate" specifically by copying the IQ output to the lineout channel, not yet possible due to required SW changes
     // Selectively mute "Right Headphone" output (LINE OUT) depending on transceiver configuration
     if (
@@ -471,8 +477,12 @@ void Codec_VolumeLineOut(uint8_t txrx_mode)
     }
     else    // receive mode - LINE OUT always enabled
     {
-        Codec_WriteRegister(CODEC_ANA_I2C, W8731_RIGHT_HEADPH_OUT,ts.lineout_gain + 0x2F);   // value selected for 0.5VRMS at AGC setting
+        Codec_WriteRegister(CODEC_ANA_I2C, W8731_RIGHT_HEADPH_OUT,lov);   // value selected for 0.5VRMS at AGC setting
     }
+#elif defined(UI_BRD_OVI40)
+    // we have a special shared lineout/headphone on the OVI40.
+    // And since we have a dedidacted IQ codec, there is no need to switch of the lineout or headphones here
+    Codec_WriteRegister(CODEC_ANA_I2C, W8731_RIGHT_HEADPH_OUT, lov | W8731_HEADPH_OUT_ZCEN | W8731_HEADPH_OUT_HPBOTH );   // value selected for 0.5VRMS at AGC setting
 #endif
 }
 
@@ -532,3 +542,4 @@ void Codec_IQInGainAdj(uchar gain)
 {
     Codec_InGainAdj(CODEC_IQ_I2C, gain);
 }
+

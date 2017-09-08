@@ -15,7 +15,7 @@
 #ifndef __UI_LCD_HY28_H
 #define __UI_LCD_HY28_H
 
-#include "mchf_types.h"
+#include "uhsdr_types.h"
 
 #define MAX_X  320
 #define MAX_Y  240
@@ -71,6 +71,15 @@
 
 #define GRADIENT_STEP			8
 
+#define TOUCHSCREEN_NO_MIRROR_NOFLIP	0
+#define TOUCHSCREEN_X_MIRROR_NOFLIP		1
+#define TOUCHSCREEN_Y_MIRROR_NOFLIP		2
+#define TOUCHSCREEN_XY_MIRROR_NOFLIP	3
+#define TOUCHSCREEN_NO_MIRROR_FLIPXY	4
+#define TOUCHSCREEN_X_MIRROR_FLIPXY		5
+#define TOUCHSCREEN_Y_MIRROR_FLIPXY		6
+#define TOUCHSCREEN_XY_MIRROR_FLIPXY	7
+
 
 // ----------------------------------------------------------
 
@@ -97,9 +106,9 @@ extern mchf_display_t mchf_display;
 // ----------------------------------------------------------
 void 	UiLcdHy28_LcdClear(ushort Color);
 
-void UiLcdHy28_PrintText(uint16_t Xpos, uint16_t Ypos, const char *str,const uint32_t Color, const uint32_t bkColor, uchar font);
-void UiLcdHy28_PrintTextRight(uint16_t Xpos, uint16_t Ypos, const char *str,const uint32_t Color, const uint32_t bkColor, uchar font);
-void UiLcdHy28_PrintTextCentered(const uint16_t bbX,const uint16_t bbY,const uint16_t bbW,const char* txt,uint32_t clr_fg,uint32_t clr_bg,uint8_t font);
+uint16_t UiLcdHy28_PrintText(uint16_t Xpos, uint16_t Ypos, const char *str,const uint32_t Color, const uint32_t bkColor, uchar font);
+uint16_t UiLcdHy28_PrintTextRight(uint16_t Xpos, uint16_t Ypos, const char *str,const uint32_t Color, const uint32_t bkColor, uchar font);
+uint16_t UiLcdHy28_PrintTextCentered(const uint16_t bbX,const uint16_t bbY,const uint16_t bbW,const char* txt,uint32_t clr_fg,uint32_t clr_bg,uint8_t font);
 
 uint16_t UiLcdHy28_TextWidth(const char *str, uchar font);
 uint16_t UiLcdHy28_TextHeight(uint8_t font);
@@ -136,7 +145,7 @@ typedef struct
     uint8_t y;
 
     bool present;
-    bool reversed;
+    uint8_t mirrored;
 } mchf_touchscreen_t;
 
 
@@ -150,6 +159,6 @@ extern mchf_touchscreen_t mchf_touchscreen;
 void    UiLcdHy28_TouchscreenDetectPress();
 void 	UiLcdHy28_TouchscreenReadCoordinates();
 bool    UiLcdHy28_TouchscreenHasProcessableCoordinates();
-void    UiLcdHy28_TouchscreenInit(bool is_reversed);
+void    UiLcdHy28_TouchscreenInit(uint8_t mirror);
 
 #endif

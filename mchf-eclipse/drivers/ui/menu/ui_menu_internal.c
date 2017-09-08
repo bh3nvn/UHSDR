@@ -194,10 +194,19 @@ const MenuDescriptor* UiMenu_GetParentForEntry(const MenuDescriptor* me)
     return retval;
 }
 
-inline bool UiMenu_IsLastInMenuGroup(const MenuDescriptor* here)
+/*
+ * @returns true if this is the last ACTIVE entry in the menu group
+ */
+inline bool UiMenu_IsLastActiveItemInMenuGroup(const MenuDescriptor* here)
 {
     const MenuGroupDescriptor* gd = UiMenu_GetParentGroupForEntry(here);
-    return UiMenu_GroupGetLast(gd) == here;
+    const MenuDescriptor* lastActive = UiMenu_GroupGetLast(gd);
+
+    for (; lastActive != NULL && UiMenu_IsEnabled(lastActive) == false && lastActive != here; lastActive = UiMenu_GetPrevEntryInGroup(lastActive)  )
+    {
+    	// we need to do nothing here
+    }
+    return lastActive == here;
 }
 inline bool UiMenu_IsFirstInMenuGroup(const MenuDescriptor* here)
 {
@@ -292,7 +301,7 @@ const MenuDescriptor* UiMenu_NextMenuEntry(const MenuDescriptor* here)
             //   - next entry is normal entry (group or entry, no difference), just use this one
             //   - last entry in menu group, go up, and search for next entry in this parent menu (recursively).
 
-            if (UiMenu_IsLastInMenuGroup(here))
+            if (UiMenu_IsLastActiveItemInMenuGroup(here))
             {
                 // we need the parent menu in order to ask for the  entry after our
                 // menu group entry
@@ -450,7 +459,7 @@ void UiMenu_UpdateMenuEntry(const MenuDescriptor* entry, uchar mode, uint8_t pos
     char out[40];
     const char blank[34] = "                               ";
 
-    if (entry != NULL && (entry->kind == MENU_ITEM || entry->kind == MENU_GROUP ||entry->kind == MENU_INFO) )
+    if (entry != NULL && (entry->kind == MENU_ITEM || entry->kind == MENU_GROUP || entry->kind == MENU_INFO || entry->kind == MENU_TEXT) )
     {
         if (mode == MENU_RENDER_ONLY)
         {
@@ -479,6 +488,8 @@ void UiMenu_UpdateMenuEntry(const MenuDescriptor* entry, uchar mode, uint8_t pos
             break;
         case MENU_INFO:
             UiMenu_UpdateHWInfoLines(entry->number,mode,pos);
+            break;
+        case MENU_TEXT:
             break;
         case MENU_GROUP:
             if (mode == MENU_PROCESS_VALUE_CHANGE)
